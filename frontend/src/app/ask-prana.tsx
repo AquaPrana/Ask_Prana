@@ -84,7 +84,7 @@ function detectRequestedFileFormat(text: string): "docx" | "pdf" | "xlsx" | null
   if (/\bpdf\b|పీడీఎఫ్|पीडीएफ/i.test(text)) return "pdf";
   if (
     /\b(docx|word\s+(document|file|format)|document\s+(format|file)|downloadable\s+document)\b/i.test(text) ||
-    /\b(in|as|into|to)\s+(a\s+|an\s+|the\s+)?(\.?doc|word|document)\b(?!\s*[-:]?\s*\d)/i.test(text) ||
+    /\b(in|as|into|to|with|by|via|using|through|on)\s+(a\s+|an\s+|the\s+)?(\.?docx?|word|document)\b(?!\s*[-:]?\s*\d)/i.test(text) ||
     /వర్డ్|డాక్యుమెంట్|वर्ड|डॉक्यूमेंट|दस्तावेज/.test(text)
   ) {
     return "docx";
@@ -1880,7 +1880,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   recordingCancelButton: {
-    backgroundColor: colors.white,
+    // Dark like the chat background, so the light label stays readable.
+    backgroundColor: colors.background,
     borderWidth: 1,
     borderColor: colors.border,
   },
@@ -1986,7 +1987,7 @@ const styles = StyleSheet.create({
   pressed: { opacity: 0.88 },
   modalOverlay: {
     flex: 1,
-    backgroundColor: "rgba(15, 23, 42, 0.45)",
+    backgroundColor: "rgba(0, 0, 0, 0.65)",
     justifyContent: "center",
     alignItems: "center",
     paddingHorizontal: 16,
@@ -1997,7 +1998,10 @@ const styles = StyleSheet.create({
     maxWidth: 440,
     maxHeight: "100%",
     alignSelf: "center",
-    backgroundColor: colors.white,
+    // Same dark surface as the Ask Prana screen.
+    backgroundColor: colors.background,
+    borderWidth: 1,
+    borderColor: colors.border,
     borderRadius: 18,
     padding: 20,
     gap: 4,
@@ -2026,10 +2030,10 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     gap: 10,
   },
-  modalOptionSelected: { backgroundColor: colors.primarySoft },
+  modalOptionSelected: { backgroundColor: "rgba(79, 140, 247, 0.16)" },
   modalOptionCopy: { flex: 1 },
   modalOptionText: { color: colors.textDark, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 14, lineHeight: 20, fontWeight: "500" },
-  modalOptionTextSelected: { color: colors.primary },
+  modalOptionTextSelected: { color: colors.primaryBright },
   modalOptionMeta: {
     color: colors.muted,
     fontFamily: ASK_PRANA_FONT_FAMILY,

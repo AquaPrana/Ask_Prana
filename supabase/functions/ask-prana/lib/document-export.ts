@@ -29,8 +29,8 @@ const INDIC_WORD_DOCUMENT = /వర్డ్|డాక్యుమెంట్|�
  * "doc" as a file format ("give me in doc", "as a doc", "doc file") — not the
  * shrimp culture-day abbreviation ("DOC 30", "at DOC", "what is the DOC").
  */
-const DOC_FORMAT_REQUEST =
-  /\b(in|as|into|to)\s+(a\s+|an\s+|the\s+)?(\.?doc)\b(?!\s*[-:]?\s*\d)|\b\.?doc\s+(file|format)\b/;
+export const DOC_FORMAT_REQUEST =
+  /\b(in|as|into|to|with|by|via|using|through|on)\s+(a\s+|an\s+|the\s+)?(\.?docx?|word|document)\b(?!\s*[-:]?\s*\d)|\b\.?doc\s+(file|format)\b|\b(give|send|share|make|create|generate|prepare|provide)\b[\s\S]{0,30}\b(a|an)\s+\.?docx?\b(?!\s*\d)/;
 
 export function isDocumentExportQuestion(question: string): boolean {
   const q = question.toLowerCase();

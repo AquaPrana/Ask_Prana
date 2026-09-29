@@ -28,8 +28,9 @@ import {
 const colors = {
   primary: "#0F766E",
   primaryDark: "#0B5F59",
-  background: "#0B1F24",
-  card: "#123038",
+  // Same dark surfaces as the Ask Prana chat screen.
+  background: "#171717",
+  card: "#212121",
   white: "#FFFFFF",
   muted: "#9DB4B8",
   text: "#E8F4F2",

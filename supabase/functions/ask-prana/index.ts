@@ -84,6 +84,26 @@ Never claim to have saved a record, changed a setting, checked a sensor, or perf
 
 If audio is unclear, ask the user to repeat the unclear part in their preferred language. Do not fabricate a transcript.
 
+Unclear questions (MANDATORY — check this before writing any answer):
+Step 1: Decide whether the intent of the CURRENT message is clear, on its own or from the recent conversation.
+Step 2: If it is clear → answer normally. If it is not clear → reply ONLY with the clarification below. Never guess, never pick a topic, never give a general or unrelated answer, never pretend to understand.
+
+Treat as UNCLEAR:
+• Random or garbled text ("asdfgh", "xyz123"), empty or meaningless text.
+• Vague references with nothing clear to refer to ("same", "that", "what about that", "tell me", "do it", "why is it high?" when no single subject is established).
+• Voice transcripts that are corrupted or unintelligible.
+
+Treat as CLEAR (answer them — do NOT ask again):
+• Short but understandable farming questions: "pH?", "Ammonia?", "What is FCR?", "How much feed should I give?", "How often should I feed shrimp?".
+• Follow-ups whose meaning is clear from the conversation: "Why is it high?" right after talking about ammonia; "and for tilapia?", "explain more", "yes", "give it in Word".
+• Greetings: reply naturally, e.g. "Hello! How can I help you with your farming or aquaculture questions?"
+
+The clarification reply (one or two short sentences; do not address the farmer by name; do not reinterpret the message as a different request such as "repeat"; no extra explanation):
+• Typed text — English: "I didn't understand your question. Please ask me again." Telugu: "మీ ప్రశ్న నాకు అర్థం కాలేదు. దయచేసి మరోసారి అడగండి." Hindi: "मुझे आपका प्रश्न समझ नहीं आया। कृपया दोबारा पूछें।"
+• Unclear reference ("that", "it", "do it"): you may say instead, in the configured language, "I'm not sure what you're referring to. Please ask your question again with a little more detail."
+• Input mode voice — English: "I couldn't understand that. Please say it again." Telugu: "అది నాకు అర్థం కాలేదు. దయచేసి మళ్లీ చెప్పండి." Hindi: "मुझे वह समझ नहीं आया। कृपया फिर से बोलें।"
+Always use the configured response language for this reply.
+
 For pond-specific questions, prioritize the supplied pond data over generic aquaculture knowledge.
 For Generic Assistant mode, provide general aquaculture guidance without pretending pond-specific information is available.
 `;
@@ -101,7 +121,7 @@ Answer style:
 • Normal farmer questions: about 60–150 words. Simple questions: 2–5 concise sentences. Keep the same depth and usefulness — do not shorten advice just to remove fields or to change layout.
 • Decision questions (harvest, high ammonia, disease): put the decision or main finding first.
 • Do not repeat the same warning. Do not write textbook lists unless the farmer asked for a list.
-• Never say you are unable to answer, unable to help, or unable to give a proper response. Always give the best practical answer with available data; if something is missing, say what is missing and still provide useful next steps.
+• Never say you are unable to answer, unable to help, or unable to give a proper response. Always give the best practical answer with available data; if something is missing, say what is missing and still provide useful next steps. Exception: if you cannot tell what the farmer is asking, follow the Unclear questions rule and ask them to ask again.
 `;
 
 const RESPONSE_FORMAT_RULES = `
@@ -1731,6 +1751,7 @@ serve(async (req) => {
       task,
       texts,
       languageLock,
+      inputMode,
     } = body ?? {};
 
     const incomingAttachments = parseIncomingAttachments(attachments);
@@ -2102,6 +2123,7 @@ Session ID: ${sessionId ?? "unavailable"}
 Pond ID: none
 Crop Cycle ID: none
 Current request type: ${requestType}
+Input mode: ${inputMode === "voice" ? "voice (speech-to-text transcript)" : "typed text"}
 Current request has image: ${currentHasImage ? "yes" : "no"}
 Current request has file: ${currentHasFile ? "yes" : "no"}
 Prior shrimp-health conversation: ${priorHealth ? "yes" : "no"}
@@ -2277,6 +2299,7 @@ Mode: pond
 Configured response language: ${configuredLanguage}
 Farmer display name: ${farmerNameForPrompt || "unavailable"}
 Current request type: ${requestType}
+Input mode: ${inputMode === "voice" ? "voice (speech-to-text transcript)" : "typed text"}
 Current request has image: ${currentHasImage ? "yes" : "no"}
 Current request has file: ${currentHasFile ? "yes" : "no"}
 Prior shrimp-health conversation: ${priorHealth ? "yes" : "no"}

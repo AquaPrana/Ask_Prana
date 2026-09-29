@@ -73,6 +73,8 @@ export type AskPranaRequestContext = {
   sessionLanguageCode?: string | null;
   /** Voice Mode only: explicit header language that must not be overridden by STT text. */
   voiceModeLanguageLock?: string | null;
+  /** "voice" when the question is a Voice Mode speech-to-text transcript. */
+  inputMode?: "voice" | "text" | null;
   languageNotes?: string | null;
   farmerDisplayName?: string | null;
 };
@@ -406,6 +408,7 @@ export async function askPrana(
     // The farmer's selected Ask Prana language is final for this turn; the Edge
     // Function must not re-detect it from the question text.
     languageLock: Boolean(enriched.voiceModeLanguageLock?.trim()),
+    inputMode: enriched.inputMode === "voice" ? "voice" : "text",
     languageNotes:
       typeof enriched.languageNotes === "string" && enriched.languageNotes.trim()
         ? enriched.languageNotes.trim()

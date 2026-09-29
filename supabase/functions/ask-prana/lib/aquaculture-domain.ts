@@ -92,7 +92,9 @@ const OTHER_FISH =
 // Stems cover plural/oblique forms (చేప/చేపలు, मछली/मछलियाँ/मछलियों).
 const OTHER_FISH_INDIC = ["చేప", "కార్ప్", "मछली", "मछलि", "कार्प", "मत्स्य"];
 
-const SHRIMP = /\b(shrimps?|prawns?|vannamei|litopenaeus|whiteleg|monodon|black\s*tiger|tiger\s*shrimp|penaeus|scampi|macrobrachium|doc)\b/i;
+// "DOC" (days of culture) is shrimp-specific — but not "with doc" / "in doc" /
+// "doc file", which ask for a Word document.
+const SHRIMP = /\b(shrimps?|prawns?|vannamei|litopenaeus|whiteleg|monodon|black\s*tiger|tiger\s*shrimp|penaeus|scampi|macrobrachium)\b|(?<!\b(in|as|into|to|with|by|via|using|through|on|a|an)\s+(the\s+)?)\bdoc\b(?!\s*(file|format|document))|\bdoc\s*[-:]?\s*\d/i;
 const SHRIMP_INDIC = ["రొయ్య", "రొయ్యలు", "వెనామీ", "వన్నామీ", "झींगा", "झींगे", "वनामी"];
 
 /** Intents where shrimp and fish may legitimately be combined. */

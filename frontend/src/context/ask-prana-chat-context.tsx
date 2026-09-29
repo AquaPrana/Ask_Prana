@@ -2025,6 +2025,8 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
           sessionLanguageCode: sessionLanguageCode || undefined,
           language: requestContext?.language,
           voiceModeLanguageLock: sessionLanguageCode || undefined,
+          // Lets Ask Prana ask "please say it again" for unclear speech.
+          inputMode: "voice",
         },
         { fromVoiceMode: true },
       );
