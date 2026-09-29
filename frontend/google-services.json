@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "295290740701",
+    "project_id": "aquaprana-6cb05",
+    "storage_bucket": "aquaprana-6cb05.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:295290740701:android:e1e2608d262c8b943ce034",
+        "android_client_info": {
+          "package_name": "com.anonymous.frontend"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyASRscJRAW7-s_z2vK1N9Ody-d5HIWakO4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
