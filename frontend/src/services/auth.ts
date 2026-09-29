@@ -1,3 +1,5 @@
+import { Platform } from "react-native";
+import type { EmailOtpType } from "@supabase/supabase-js";
 import {
   acceptAuthenticatedSession,
   ensureValidSession,
@@ -48,6 +50,99 @@ export async function verifyOTP(
   return result;
 }
 
-export async function logout() {
-  return await supabase.auth.signOut();
+/**
+ * Ends the current user's session on this device only. Server data (profile,
+ * ponds, Ask Prana history, files) is never touched. Supabase emits
+ * SIGNED_OUT, which the profile and Ask Prana contexts use to reset state.
+ */
+/**
+ * Web only: finishes sign-in when Ask Prana is opened from an email link.
+ * Handles every link format Supabase can send — `#access_token` (implicit),
+ * `?token_hash=&type=` (custom template), `?code=` (PKCE) — and link errors
+ * such as an expired/used link, then removes the tokens from the address bar.
+ * Returns an error message for the login screen when the link can't be used.
+ */
+// Address the app was opened with, captured before the Supabase client can
+// strip the link's #tokens/#error from it. Processed at most once.
+const INITIAL_WEB_URL =
+  Platform.OS === "web" && typeof window !== "undefined" ? window.location.href : "";
+let emailLinkProcessed = false;
+
+export async function completeEmailLinkSignIn(): Promise<{
+  handled: boolean;
+  error: string | null;
+}> {
+  if (Platform.OS !== "web" || typeof window === "undefined" || emailLinkProcessed) {
+    return { handled: false, error: null };
+  }
+  emailLinkProcessed = true;
+  const url = new URL(INITIAL_WEB_URL || window.location.href);
+  const hash = new URLSearchParams(url.hash.replace(/^#/, ""));
+  const query = url.searchParams;
+  const get = (key: string) => hash.get(key) ?? query.get(key);
+
+  const linkError = get("error_code") || get("error");
+  const tokenHash = query.get("token_hash");
+  const code = query.get("code");
+  const accessToken = hash.get("access_token");
+  const refreshToken = hash.get("refresh_token");
+  if (!linkError && !tokenHash && !code && !accessToken) {
+    return { handled: false, error: null };
+  }
+
+  const clearUrl = () => {
+    window.history.replaceState(null, "", `${url.origin}${url.pathname}`);
+  };
+
+  if (linkError) {
+    clearUrl();
+    const expired = /otp_expired|expired/i.test(`${linkError} ${get("error_description") ?? ""}`);
+    console.warn("[auth] email link error:", linkError);
+    return {
+      handled: true,
+      error: expired
+        ? "This sign-in link has expired or was already used. Please request a new one."
+        : "This sign-in link couldn't be used. Please request a new one.",
+    };
+  }
+
+  let failed = false;
+  if (tokenHash) {
+    const type = (query.get("type") || "magiclink") as EmailOtpType;
+    const { error } = await supabase.auth.verifyOtp({ token_hash: tokenHash, type });
+    failed = Boolean(error);
+  } else if (code) {
+    const { error } = await supabase.auth.exchangeCodeForSession(code);
+    failed = Boolean(error);
+  } else if (accessToken && refreshToken) {
+    // Normally read automatically (detectSessionInUrl); set it if that missed.
+    const { data } = await supabase.auth.getSession();
+    if (!data.session) {
+      const { error } = await supabase.auth.setSession({
+        access_token: accessToken,
+        refresh_token: refreshToken,
+      });
+      failed = Boolean(error);
+    }
+  }
+  clearUrl();
+  if (failed) {
+    console.warn("[auth] email link sign-in failed");
+    return {
+      handled: true,
+      error: "This sign-in link has expired or was already used. Please request a new one.",
+    };
+  }
+  return { handled: true, error: null };
+}
+
+export async function logout(): Promise<{ error: Error | null }> {
+  const { error } = await supabase.auth.signOut({ scope: "local" });
+  if (error && !isAuthSessionMissing(error)) {
+    // Safe diagnostics only — never log tokens or the session object.
+    console.warn("[auth] signOut failed:", error.name, error.message);
+    return { error };
+  }
+  // An already-expired/missing session counts as logged out.
+  return { error: null };
 }

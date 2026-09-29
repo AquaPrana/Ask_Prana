@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  Modal,
+  Platform,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -11,11 +13,19 @@ import {
   View,
 } from "react-native";
 import Feather from "@expo/vector-icons/Feather";
-import { useRouter } from "expo-router";
+import { useFocusEffect, useRouter } from "expo-router";
+import { useTranslation } from "react-i18next";
 import { useProfile } from "../context/profile-context";
-import { supabase } from "../lib/supabase";
+import { subscribeToAuthSession, supabase } from "../lib/supabase";
+import { logout } from "../services/auth";
 import {
+  type AuthEmailState,
+  getCurrentUserEmailState,
   getCurrentUserProfile,
+  isValidEmail,
+  normalizeEmail,
+  requestCurrentUserEmailChange,
+  resendEmailChangeVerification,
   updateCurrentUserProfile,
 } from "../services/profile";
 
@@ -26,19 +36,55 @@ const colors = {
   text: "#F5F5F5",
   muted: "#A0A0A0",
   primary: "#4F8CF7",
+  danger: "#F87171",
+  success: "#34D399",
+  warning: "#FBBF24",
 };
+
+const EMAIL_STATUS_BADGE: Record<AuthEmailState["status"], { text: string; color: string }> = {
+  none: { text: "Email not added", color: colors.muted },
+  verified: { text: "Verified", color: colors.success },
+  unverified: { text: "Not verified", color: colors.warning },
+  pending: { text: "Verification pending", color: colors.warning },
+};
+
+const VERIFICATION_SENT_MESSAGE =
+  "Verification email sent to your new email address. Please open the email and confirm your new email address.";
 
 export default function EditProfileScreen() {
   const router = useRouter();
+  const { t } = useTranslation();
   const { applyProfileUpdate } = useProfile();
+  const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
+  const [logoutError, setLogoutError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [email, setEmail] = useState("");
+  // Email as the Supabase Auth account currently holds it (confirmed + pending).
+  const [emailState, setEmailState] = useState<AuthEmailState | null>(null);
+  const [emailError, setEmailError] = useState<string | null>(null);
+  const [emailNotice, setEmailNotice] = useState<string | null>(null);
+  const [resending, setResending] = useState(false);
+  // True once the farmer types in the Email field, so refreshes never overwrite it.
+  const emailDirtyRef = useRef(false);
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
   const [state, setState] = useState("");
   const [district, setDistrict] = useState("");
   const [language, setLanguage] = useState("English");
+
+  const applyEmailState = useCallback((next: AuthEmailState) => {
+    setEmailState(next);
+    if (!emailDirtyRef.current) setEmail(next.pendingEmail || next.email);
+    if (next.status !== "pending") setEmailNotice(null);
+  }, []);
+
+  /** Re-reads the Auth user from the server, e.g. after the verification link. */
+  const refreshEmailState = useCallback(async () => {
+    const { state: next } = await getCurrentUserEmailState();
+    if (next) applyEmailState(next);
+  }, [applyEmailState]);
 
   const loadProfile = useCallback(async () => {
     setLoading(true);
@@ -59,53 +105,158 @@ export default function EditProfileScreen() {
       return;
     }
 
-    setEmail(user.email ?? "");
+    // Set once when the profile loads (never on every render), so typing is kept.
+    emailDirtyRef.current = false;
+    const { state: authEmail } = await getCurrentUserEmailState();
+    if (authEmail) applyEmailState(authEmail);
     setName(profile?.name ?? "");
     setPhone(profile?.phone ?? user.phone ?? "");
     setState(profile?.state ?? "");
     setDistrict(profile?.district ?? "");
     setLanguage(profile?.language ?? "English");
     setLoading(false);
-  }, [router]);
+  }, [applyEmailState, router]);
 
   useEffect(() => {
     void loadProfile();
   }, [loadProfile]);
+
+  // Pick up a confirmation done in the email app or another tab: on screen
+  // focus, on browser tab focus, and when the verification link updates the session.
+  useFocusEffect(
+    useCallback(() => {
+      void refreshEmailState();
+    }, [refreshEmailState]),
+  );
+  useEffect(() => {
+    if (Platform.OS !== "web" || typeof window === "undefined") return;
+    const onFocus = () => void refreshEmailState();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [refreshEmailState]);
+  useEffect(() => {
+    const unsubscribe = subscribeToAuthSession((session, event) => {
+      if (session?.user && (event === "USER_UPDATED" || event === "SIGNED_IN")) {
+        void refreshEmailState();
+      }
+    });
+    return () => {
+      unsubscribe();
+    };
+  }, [refreshEmailState]);
 
   const save = async () => {
     if (!name.trim()) {
       Alert.alert("Name required", "Please enter your full name.");
       return;
     }
+    // Validate on save only (typing is never blocked) and before any request.
+    const nextEmail = normalizeEmail(email);
+    const currentEmail = normalizeEmail(emailState?.pendingEmail || emailState?.email || "");
+    const emailChanged = nextEmail !== currentEmail;
+    if (nextEmail && !isValidEmail(nextEmail)) {
+      setEmailError("Please enter a valid email address, for example farmer@example.com.");
+      return;
+    }
+    if (!nextEmail && currentEmail) {
+      setEmailError("Email can't be removed once added. Enter a new email address or keep the current one.");
+      return;
+    }
+    setEmailError(null);
     setSaving(true);
-    const { error } = await updateCurrentUserProfile({
-      name: name.trim(),
-      phone: phone.trim(),
-      state: state.trim(),
-      district: district.trim(),
-      language: language.trim() || "English",
-    });
-    setSaving(false);
+    try {
+      const { error } = await updateCurrentUserProfile({
+        name: name.trim(),
+        phone: phone.trim(),
+        state: state.trim(),
+        district: district.trim(),
+        language: language.trim() || "English",
+      });
+      if (error) {
+        Alert.alert("Unable to save profile", error.message);
+        return;
+      }
+      const { profile: savedProfile, error: reloadError } = await getCurrentUserProfile();
+      if (reloadError || !savedProfile) {
+        Alert.alert("Profile saved", "Your changes were saved, but the profile could not be refreshed yet.");
+        return;
+      }
+      await applyProfileUpdate({
+        name: savedProfile.name,
+        state: savedProfile.state,
+        district: savedProfile.district,
+        language: savedProfile.language,
+        phone: savedProfile.phone ?? "",
+        avatarUrl: savedProfile.avatarUrl ?? null,
+        avatarUpdatedAt: savedProfile.avatarUpdatedAt ?? null,
+      });
+
+      // Unchanged email (ignoring case/whitespace) sends no Auth request.
+      if (emailChanged && nextEmail) {
+        // Email belongs to the Supabase Auth account, not the users table.
+        const result = await requestCurrentUserEmailChange(nextEmail);
+        if (result.error) {
+          setEmailError(`Your other details were saved. ${result.error}`);
+          return;
+        }
+        emailDirtyRef.current = false;
+        setEmail(nextEmail);
+        if (result.state) applyEmailState(result.state);
+        if (!result.state || result.state.status === "pending") {
+          // Not changed until the emailed code is verified for this same account.
+          setEmailNotice(
+            currentEmail
+              ? `${VERIFICATION_SENT_MESSAGE} If asked, also confirm from your current email (${currentEmail}).`
+              : VERIFICATION_SENT_MESSAGE,
+          );
+          openEmailVerification(nextEmail);
+          return;
+        }
+      }
+
+      Alert.alert("Profile updated", "Your profile changes have been saved.");
+      router.back();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /** Code entry for an email change already requested for this account. */
+  const openEmailVerification = (address: string) => {
+    router.push({
+      pathname: "/verify-email",
+      params: { email: address, sent: "1", next: "back" },
+    } as never);
+  };
+
+  const resendVerification = async () => {
+    const pending = emailState?.pendingEmail;
+    if (!pending || resending) return;
+    setResending(true);
+    setEmailError(null);
+    const { error } = await resendEmailChangeVerification(pending);
+    setResending(false);
     if (error) {
-      Alert.alert("Unable to save profile", error.message);
+      setEmailError(error);
       return;
     }
-    const { profile: savedProfile, error: reloadError } = await getCurrentUserProfile();
-    if (reloadError || !savedProfile) {
-      Alert.alert("Profile saved", "Your changes were saved, but the profile could not be refreshed yet.");
+    setEmailNotice(`Verification email sent again to ${pending}. Please check your inbox and spam folder.`);
+  };
+
+  const confirmLogout = async () => {
+    setLoggingOut(true);
+    setLogoutError(null);
+    const { error } = await logout();
+    setLoggingOut(false);
+    if (error) {
+      // Stay signed in and tell the farmer; never pretend logout succeeded.
+      setLogoutError(t("profile.logoutFailed"));
       return;
     }
-    await applyProfileUpdate({
-      name: savedProfile.name,
-      state: savedProfile.state,
-      district: savedProfile.district,
-      language: savedProfile.language,
-      phone: savedProfile.phone ?? "",
-      avatarUrl: savedProfile.avatarUrl ?? null,
-      avatarUpdatedAt: savedProfile.avatarUpdatedAt ?? null,
-    });
-    Alert.alert("Profile updated", "Your profile changes have been saved.");
-    router.back();
+    setLogoutConfirmOpen(false);
+    // Drop private screens from the stack so Back cannot reopen them.
+    if (router.canDismiss()) router.dismissAll();
+    router.replace("/phone-login" as never);
   };
 
   if (loading) {
@@ -128,7 +279,50 @@ export default function EditProfileScreen() {
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
         <Text style={styles.caption}>Your account details</Text>
         <Field label="Full name" value={name} onChangeText={setName} autoCapitalize="words" />
-        <Field label="Email" value={email} editable={false} keyboardType="email-address" />
+        <Field
+          label="Email"
+          badge={emailState ? EMAIL_STATUS_BADGE[emailState.status] : null}
+          value={email}
+          onChangeText={(value) => {
+            emailDirtyRef.current = true;
+            setEmail(value);
+            if (emailError) setEmailError(null);
+          }}
+          keyboardType="email-address"
+          inputMode="email"
+          autoCapitalize="none"
+          autoCorrect={false}
+          autoComplete="email"
+          textContentType="emailAddress"
+          placeholder="farmer@example.com"
+          error={emailError}
+          hint={
+            emailNotice ??
+            (emailState?.status === "pending"
+              ? `Waiting for confirmation of ${emailState.pendingEmail}. Open the link sent to that address to finish the change.`
+              : null)
+          }
+        />
+        {emailState?.status === "pending" ? (
+          <Pressable
+            onPress={() => openEmailVerification(emailState.pendingEmail)}
+            style={({ pressed }) => [styles.resendLink, pressed && styles.resendLinkPressed]}
+            accessibilityRole="button"
+          >
+            <Text style={styles.resendLinkText}>Enter verification code</Text>
+          </Pressable>
+        ) : null}
+        {emailState?.status === "pending" ? (
+          <Pressable
+            onPress={() => void resendVerification()}
+            disabled={resending}
+            style={({ pressed }) => [styles.resendLink, (pressed || resending) && styles.resendLinkPressed]}
+            accessibilityRole="button"
+          >
+            {resending ? <ActivityIndicator size="small" color={colors.primary} /> : null}
+            <Text style={styles.resendLinkText}>Resend verification email</Text>
+          </Pressable>
+        ) : null}
         <Field label="Phone number" value={phone} onChangeText={setPhone} keyboardType="phone-pad" />
         <Field label="State" value={state} onChangeText={setState} autoCapitalize="words" />
         <Field label="District" value={district} onChangeText={setDistrict} autoCapitalize="words" />
@@ -136,13 +330,42 @@ export default function EditProfileScreen() {
         <Pressable onPress={() => void save()} disabled={saving} style={[styles.saveButton, saving && styles.saveButtonDisabled]} accessibilityRole="button">
           {saving ? <ActivityIndicator color={colors.text} /> : <Text style={styles.saveText}>Save changes</Text>}
         </Pressable>
+        <Pressable
+          onPress={() => {
+            setLogoutError(null);
+            setLogoutConfirmOpen(true);
+          }}
+          style={({ pressed, hovered }) => [styles.logoutButton, hovered && styles.logoutButtonHovered, pressed && styles.logoutButtonPressed]}
+          accessibilityRole="button"
+          accessibilityLabel={t("profile.logout")}
+        >
+          <Feather name="log-out" size={17} color={colors.danger} />
+          <Text style={styles.logoutText}>{t("profile.logout")}</Text>
+        </Pressable>
       </ScrollView>
+      <Modal visible={logoutConfirmOpen} transparent animationType="fade" onRequestClose={() => !loggingOut && setLogoutConfirmOpen(false)}>
+        <View style={styles.dialogBackdrop}>
+          <View style={styles.dialog}>
+            <Text style={styles.dialogTitle}>{t("profile.logoutConfirmTitle")}</Text>
+            <Text style={styles.dialogBody}>{t("profile.logoutConfirmBody")}</Text>
+            {logoutError ? <Text style={styles.dialogError}>{logoutError}</Text> : null}
+            <View style={styles.dialogActions}>
+              <Pressable onPress={() => setLogoutConfirmOpen(false)} disabled={loggingOut} style={styles.dialogCancel} accessibilityRole="button">
+                <Text style={styles.dialogCancelText}>{t("common.cancel")}</Text>
+              </Pressable>
+              <Pressable onPress={() => void confirmLogout()} disabled={loggingOut} style={[styles.dialogLogout, loggingOut && styles.saveButtonDisabled]} accessibilityRole="button">
+                {loggingOut ? <ActivityIndicator color={colors.text} /> : <Text style={styles.saveText}>{t("profile.logout")}</Text>}
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
 
-function Field({ label, editable = true, ...inputProps }: React.ComponentProps<typeof TextInput> & { label: string }) {
-  return <View style={styles.field}><Text style={styles.label}>{label}</Text><TextInput {...inputProps} editable={editable} style={[styles.input, !editable && styles.inputDisabled]} placeholderTextColor={colors.muted} /></View>;
+function Field({ label, editable = true, error, hint, badge, ...inputProps }: React.ComponentProps<typeof TextInput> & { label: string; error?: string | null; hint?: string | null; badge?: { text: string; color: string } | null }) {
+  return <View style={styles.field}><View style={styles.labelRow}><Text style={styles.label}>{label}</Text>{badge ? <Text style={[styles.badge, { color: badge.color, borderColor: badge.color }]}>{badge.text}</Text> : null}</View><TextInput {...inputProps} editable={editable} style={[styles.input, !editable && styles.inputDisabled, error ? styles.inputError : null]} placeholderTextColor={colors.muted} />{error ? <Text style={styles.errorText} accessibilityLiveRegion="polite">{error}</Text> : hint ? <Text style={styles.hintText}>{hint}</Text> : null}</View>;
 }
 
 const styles = StyleSheet.create({
@@ -157,7 +380,28 @@ const styles = StyleSheet.create({
   label: { color: colors.text, fontSize: 14, lineHeight: 20, fontWeight: "500" },
   input: { minHeight: 46, color: colors.text, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 8, paddingHorizontal: 12, fontSize: 15, lineHeight: 21, fontWeight: "400" },
   inputDisabled: { color: colors.muted, opacity: 0.8 },
+  inputError: { borderColor: colors.danger },
+  errorText: { color: colors.danger, fontSize: 13, lineHeight: 18, fontWeight: "500" },
+  labelRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 },
+  badge: { fontSize: 12, lineHeight: 16, fontWeight: "600", borderWidth: 1, borderRadius: 999, paddingHorizontal: 8, paddingVertical: 2, overflow: "hidden" },
+  resendLink: { flexDirection: "row", alignItems: "center", gap: 8, alignSelf: "flex-start", marginTop: -8, paddingVertical: 4 },
+  resendLinkPressed: { opacity: 0.6 },
+  resendLinkText: { color: colors.primary, fontSize: 13, lineHeight: 18, fontWeight: "600" },
+  hintText: { color: colors.muted, fontSize: 13, lineHeight: 18, fontWeight: "400" },
   saveButton: { minHeight: 46, marginTop: 8, borderRadius: 8, alignItems: "center", justifyContent: "center", backgroundColor: colors.primary },
   saveButtonDisabled: { opacity: 0.6 },
   saveText: { color: colors.text, fontSize: 14, lineHeight: 20, fontWeight: "600" },
+  logoutButton: { minHeight: 46, flexDirection: "row", gap: 8, borderRadius: 8, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.border, backgroundColor: colors.card },
+  logoutButtonHovered: { borderColor: colors.danger },
+  logoutButtonPressed: { opacity: 0.7 },
+  logoutText: { color: colors.danger, fontSize: 14, lineHeight: 20, fontWeight: "600" },
+  dialogBackdrop: { flex: 1, justifyContent: "center", paddingHorizontal: 24, backgroundColor: "rgba(0,0,0,0.65)" },
+  dialog: { width: "100%", maxWidth: 420, alignSelf: "center", padding: 20, gap: 14, borderRadius: 10, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.card },
+  dialogTitle: { color: colors.text, fontSize: 17, lineHeight: 22, fontWeight: "600" },
+  dialogBody: { color: colors.muted, fontSize: 14, lineHeight: 21, fontWeight: "400" },
+  dialogError: { color: colors.danger, fontSize: 13, lineHeight: 19, fontWeight: "500" },
+  dialogActions: { flexDirection: "row", justifyContent: "flex-end", gap: 8 },
+  dialogCancel: { minHeight: 38, justifyContent: "center", paddingHorizontal: 12 },
+  dialogCancelText: { color: colors.text, fontSize: 13, lineHeight: 18, fontWeight: "500" },
+  dialogLogout: { minHeight: 38, minWidth: 88, justifyContent: "center", alignItems: "center", paddingHorizontal: 14, borderRadius: 6, backgroundColor: "#B94444" },
 });

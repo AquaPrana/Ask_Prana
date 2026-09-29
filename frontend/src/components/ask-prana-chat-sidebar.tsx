@@ -15,11 +15,12 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useRouter } from "expo-router";
 import { useTranslation } from "react-i18next";
 import { UserAvatar } from "./user-avatar";
+import { AskPranaLogo } from "./ask-prana-logo";
 import { useProfile } from "../context/profile-context";
 import { useAskPranaChat } from "../context/ask-prana-chat-context";
 import { ASK_PRANA_FONT_FAMILY } from "../constants/ask-prana-typography";
 import type { AskPranaSessionSummary } from "../services/ask-prana-messages";
-import { translateAskPranaHistory } from "../services/ask-prana";
+import { useAskPranaDisplayTranslation } from "../lib/ask-prana-display-translation";
 
 const colors = {
   accent: "#4F8CF7",
@@ -130,7 +131,7 @@ export function AskPranaChatSidebar({
   onNewChat,
   onConversationDeleted,
 }: Props) {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const router = useRouter();
   const { displayName, avatarUrl, avatarUpdatedAt } = useProfile();
   const {
@@ -144,10 +145,9 @@ export function AskPranaChatSidebar({
   } = useAskPranaChat();
 
   const [sessions, setSessions] = useState<AskPranaSessionSummary[]>([]);
-  const [displayTranslations, setDisplayTranslations] = useState<Record<string, string>>({});
-  const [translationLanguage, setTranslationLanguage] = useState<"en" | "te" | "hi" | null>(null);
   const [searchText, setSearchText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  // i18n key, so the message follows the selected language.
   const [loadError, setLoadError] = useState<string | null>(null);
   const [menuSessionId, setMenuSessionId] = useState<string | null>(null);
   const [menuSource, setMenuSource] = useState<"pinned" | "history" | null>(null);
@@ -215,7 +215,7 @@ export function AskPranaChatSidebar({
       } catch {
         if (requestId === historyRequestIdRef.current) {
           setSessions([]);
-          setLoadError("Unable to load your conversation history. Please try again.");
+          setLoadError("askPrana.historyLoadError");
         }
       } finally {
         if (requestId === historyRequestIdRef.current) setIsLoading(false);
@@ -230,43 +230,23 @@ export function AskPranaChatSidebar({
     return () => clearTimeout(timer);
   }, [activeSessionId, loadHistory, messages.length, visible]);
 
-  useEffect(() => {
-    const language = i18n.resolvedLanguage as "en" | "te" | "hi";
-    if (language !== "te" && language !== "hi") {
-      setDisplayTranslations({});
-      setTranslationLanguage("en");
-      return;
-    }
-    const originals = [...new Set(sessions.flatMap((session) => [session.title, session.preview]).filter(Boolean))];
-    if (!originals.length) return;
-    let active = true;
-    void translateAskPranaHistory(originals, language).then((translated) => {
-      if (!active) return;
-      setDisplayTranslations(Object.fromEntries(originals.map((source, index) => [source, translated[index] || source])));
-      setTranslationLanguage(language);
-    }).catch(() => {
-      if (active) {
-        setDisplayTranslations({});
-        setTranslationLanguage(null);
-      }
-    }).finally(() => {
-    });
-    return () => { active = false; };
-  }, [i18n.resolvedLanguage, sessions]);
-
-  const displayText = useCallback(
-    (text: string) => translationLanguage === i18n.resolvedLanguage
-      ? (displayTranslations[text] || t("common.loading"))
-      : (i18n.resolvedLanguage === "en" ? text : t("common.loading")),
-    [displayTranslations, i18n.resolvedLanguage, t, translationLanguage],
+  // Every loaded session (pinned, grouped and search results alike) is
+  // translated into the selected language; originals are never shown as a
+  // fallback while another language is selected.
+  const { displayText, getStatus } = useAskPranaDisplayTranslation(
+    sessions.flatMap((session) => [session.title, session.preview].filter(Boolean)),
   );
 
   const visibleSessions = useMemo(() => {
     if (!normalizedSearch) return sessions;
     return sessions.filter((session) => {
-      const title = displayText(session.title).trim().toLocaleLowerCase();
-      const preview = displayText(session.preview).trim().toLocaleLowerCase();
-      return title.includes(normalizedSearch) || preview.includes(normalizedSearch);
+      // Match the displayed (selected-language) text and the stored original.
+      return [
+        displayText(session.title),
+        session.preview ? displayText(session.preview) : "",
+        session.title,
+        session.preview,
+      ].some((value) => value?.trim().toLocaleLowerCase().includes(normalizedSearch));
     });
   }, [displayText, normalizedSearch, sessions]);
 
@@ -321,7 +301,7 @@ export function AskPranaChatSidebar({
     if (!renamingSession) return;
     const { error } = await renameConversation(renamingSession.id, renameValue);
     if (error) {
-      setLoadError("Unable to rename this conversation. Please try again.");
+      setLoadError("askPrana.renameError");
       return;
     }
     setRenamingSession(null);
@@ -334,7 +314,7 @@ export function AskPranaChatSidebar({
     const sessionId = deletingSession.id;
     const { error } = await deleteConversation(sessionId);
     if (error) {
-      setLoadError("Unable to delete this conversation. Please try again.");
+      setLoadError("askPrana.deleteError");
       return;
     }
     if (activeSessionId === sessionId) onConversationDeleted(sessionId);
@@ -364,12 +344,15 @@ export function AskPranaChatSidebar({
     <View style={[styles.sidebar, isDesktop && styles.desktopSidebar]}>
       <View style={styles.topArea}>
         <View style={styles.brandRow}>
-          <Text style={styles.brand}>ASK PRANA</Text>
+          <View style={styles.brandMark}>
+            <AskPranaLogo size={30} decorative />
+            <Text style={styles.brand}>ASK PRANA</Text>
+          </View>
           <Pressable
             onPress={onClose}
             style={styles.iconButton}
             accessibilityRole="button"
-            accessibilityLabel={isDesktop ? "Collapse history sidebar" : "Close conversation history"}
+            accessibilityLabel={isDesktop ? t("askPrana.collapseSidebar") : t("askPrana.closeHistory")}
           >
             <Feather
               name={isDesktop ? "sidebar" : "x"}
@@ -402,7 +385,7 @@ export function AskPranaChatSidebar({
               onPress={() => setSearchText("")}
               hitSlop={8}
               accessibilityRole="button"
-              accessibilityLabel="Clear search"
+              accessibilityLabel={t("askPrana.clearSearch")}
             >
               <Feather name="x" size={15} color={colors.muted} />
             </Pressable>
@@ -421,7 +404,7 @@ export function AskPranaChatSidebar({
             <ActivityIndicator size="small" color={colors.accent} />
           </View>
         ) : loadError ? (
-          <Text style={styles.emptyText}>{loadError}</Text>
+          <Text style={styles.emptyText}>{t(loadError)}</Text>
         ) : groupedSessions.length === 0 && pinnedSessions.length === 0 ? (
           <Text style={styles.emptyText}>
             {normalizedSearch ? t("askPrana.noConversationsFound") : t("askPrana.historyEmpty")}
@@ -450,7 +433,7 @@ export function AskPranaChatSidebar({
                     pressed && styles.pressed,
                   ]}
                   accessibilityRole="button"
-                  accessibilityLabel={`Open pinned ${session.title}`}
+                  accessibilityLabel={t("askPrana.openConversationLabel", { title: displayText(session.title) })}
                 >
                   <View style={styles.itemCopy}>
                     <View style={styles.itemTitleRow}>
@@ -476,7 +459,7 @@ export function AskPranaChatSidebar({
                   hitSlop={6}
                   nativeID={`ask-prana-menu-trigger-${session.id}`}
                   accessibilityRole="button"
-                  accessibilityLabel={`Conversation options for ${session.title}`}
+                  accessibilityLabel={t("askPrana.conversationOptions", { title: displayText(session.title) })}
                 >
                   <Feather name="more-horizontal" size={17} color={colors.muted} />
                 </Pressable>
@@ -487,7 +470,7 @@ export function AskPranaChatSidebar({
                     onTogglePin={() => togglePinned(session.id)}
                     onEdit={() => {
                       setRenamingSession(session);
-                      setRenameValue(session.title);
+                      setRenameValue(getStatus(session.title) === "ready" ? displayText(session.title) : "");
                       setMenuSessionId(null);
                     }}
                     onDelete={() => {
@@ -522,7 +505,7 @@ export function AskPranaChatSidebar({
                       pressed && styles.pressed,
                     ]}
                     accessibilityRole="button"
-                    accessibilityLabel={`Open ${session.title}`}
+                    accessibilityLabel={t("askPrana.openConversationLabel", { title: displayText(session.title) })}
                   >
                     <View style={styles.itemCopy}>
                       <View style={styles.itemTitleRow}>
@@ -550,7 +533,7 @@ export function AskPranaChatSidebar({
                     hitSlop={6}
                     nativeID={`ask-prana-menu-trigger-${session.id}`}
                     accessibilityRole="button"
-                    accessibilityLabel={`Conversation options for ${session.title}`}
+                    accessibilityLabel={t("askPrana.conversationOptions", { title: displayText(session.title) })}
                   >
                     <Feather name="more-horizontal" size={17} color={colors.muted} />
                   </Pressable>
@@ -561,7 +544,7 @@ export function AskPranaChatSidebar({
                       onTogglePin={() => togglePinned(session.id)}
                       onEdit={() => {
                         setRenamingSession(session);
-                        setRenameValue(session.title);
+                        setRenameValue(getStatus(session.title) === "ready" ? displayText(session.title) : "");
                         setMenuSessionId(null);
                         setMenuSource(null);
                       }}
@@ -596,7 +579,7 @@ export function AskPranaChatSidebar({
         />
         <View style={styles.profileCopy}>
           <Text style={styles.profileName} numberOfLines={1}>{displayName}</Text>
-          <Text style={styles.profileSubtitle}>Account</Text>
+          <Text style={styles.profileSubtitle}>{t("askPrana.account")}</Text>
         </View>
         <Feather name="chevron-right" size={16} color={colors.muted} />
       </Pressable>
@@ -629,14 +612,14 @@ export function AskPranaChatSidebar({
       >
         <View style={styles.dialogBackdrop}>
           <View style={styles.dialog}>
-            <Text style={styles.dialogTitle}>Rename conversation</Text>
+            <Text style={styles.dialogTitle}>{t("askPrana.renameConversation")}</Text>
             <TextInput
               value={renameValue}
               onChangeText={setRenameValue}
               style={styles.renameInput}
               autoFocus
               maxLength={60}
-              placeholder="Conversation title"
+              placeholder={t("askPrana.conversationTitle")}
               placeholderTextColor={colors.muted}
             />
             <View style={styles.dialogActions}>
@@ -704,7 +687,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
   },
-  brand: { color: colors.text, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 16, lineHeight: 21, fontWeight: "600" },
+  brandMark: { flexDirection: "row", alignItems: "center", gap: 10 },
+  brand: { color: colors.text, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 18, lineHeight: 23, fontWeight: "600" },
   iconButton: { width: 32, height: 32, alignItems: "center", justifyContent: "center" },
   newChatButton: {
     minHeight: 42,

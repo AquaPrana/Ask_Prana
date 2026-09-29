@@ -27,22 +27,26 @@ import {
   useSafeAreaInsets,
 } from "react-native-safe-area-context";
 import {
+  AUTH_DARK_BACKGROUND,
   PhoneLoginBackground,
   usePhoneLoginWaveClipHeight,
   usePhoneLoginWaveInset,
 } from "../components/phone-login-background";
 
 const colors = {
-  teal: "#0F766E",
+  // Dark Ask Prana theme — matches the phone login screen.
+  teal: "#2DD4BF",
   tealDark: "#0B5F59",
-  background: "#F7F4EF",
-  text: "#0B2E32",
+  background: AUTH_DARK_BACKGROUND,
+  text: "#F5F5F5",
   white: "#FFFFFF",
-  mutedText: "#3D5553",
-  mutedSoft: "#6B7C7A",
-  borderEmpty: "#D4C9BB",
-  otpEmptyFill: "#F3EDE4",
-  shadow: "#0B5F59",
+  mutedText: "#C9D1D0",
+  mutedSoft: "#A0A0A0",
+  borderEmpty: "#363636",
+  otpEmptyFill: "#1B1B1B",
+  otpFilledFill: "#212121",
+  card: "#212121",
+  shadow: "#000000",
 };
 
 function formatPhoneDisplay(phone?: string) {
@@ -309,9 +313,9 @@ export default function VerifyOtpScreen() {
 
   return (
     <View style={styles.root}>
-      <StatusBar barStyle="light-content" backgroundColor={colors.tealDark} />
+      <StatusBar barStyle="light-content" backgroundColor={colors.background} />
 
-      <PhoneLoginBackground waveProfile={waveProfile}>
+      <PhoneLoginBackground waveProfile={waveProfile} appearance="dark">
         <KeyboardAvoidingView
           style={styles.keyboardView}
           behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -469,7 +473,7 @@ export default function VerifyOtpScreen() {
 const styles = StyleSheet.create({
   root: {
     flex: 1,
-    backgroundColor: colors.tealDark,
+    backgroundColor: colors.background,
     overflow: "hidden",
   },
   keyboardView: {
@@ -503,7 +507,9 @@ const styles = StyleSheet.create({
     width: 40,
     height: 40,
     borderRadius: 12,
-    backgroundColor: colors.white,
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.borderEmpty,
     alignItems: "center",
     justifyContent: "center",
     zIndex: 2,
@@ -514,7 +520,7 @@ const styles = StyleSheet.create({
     elevation: 2,
   },
   backArrow: {
-    color: colors.tealDark,
+    color: colors.text,
     fontSize: 20,
     fontWeight: "700",
     lineHeight: 22,
@@ -524,9 +530,9 @@ const styles = StyleSheet.create({
     ...StyleSheet.absoluteFill,
     textAlign: "center",
     textAlignVertical: "center",
-    color: colors.white,
-    fontSize: 28,
-    fontWeight: "800",
+    color: colors.text,
+    fontSize: 22,
+    fontWeight: "700",
     lineHeight: 44,
   },
   contentArea: {
@@ -577,10 +583,10 @@ const styles = StyleSheet.create({
   otpBoxFilled: {
     borderColor: colors.teal,
     borderWidth: 2,
-    backgroundColor: colors.white,
+    backgroundColor: colors.otpFilledFill,
   },
   otpDigit: {
-    color: colors.tealDark,
+    color: colors.text,
     fontSize: 30,
     fontWeight: "800",
     lineHeight: 34,

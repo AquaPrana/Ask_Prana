@@ -21,6 +21,8 @@ const WAVE_ASSET_HEIGHT = 513;
 const WAVE_CONTENT_HEIGHT = 446;
 
 const SCREEN_BACKGROUND = "#F7F4EF";
+/** Same dark surface as the Ask Prana screen. */
+export const AUTH_DARK_BACKGROUND = "#171717";
 
 export type AppScreenWaveProfile = "compact" | "tall" | "ponds";
 
@@ -99,6 +101,11 @@ type PhoneLoginBackgroundProps = {
   waveAlign?: "bottom" | "top";
   /** Extra translateY for the wave image (negative = move up / crop top). */
   waveOffsetY?: number;
+  /**
+   * light = cream pattern + teal wave artwork.
+   * dark = flat Ask Prana dark surface (no pattern/wave), used by the auth screens.
+   */
+  appearance?: "light" | "dark";
 };
 
 export function PhoneLoginBackground({
@@ -106,6 +113,7 @@ export function PhoneLoginBackground({
   waveProfile = "compact",
   waveAlign = "bottom",
   waveOffsetY = 0,
+  appearance = "light",
 }: PhoneLoginBackgroundProps) {
   const { windowWidth, waveClipHeight, imageHeight, translateY } =
     useWaveMetrics(waveProfile);
@@ -113,6 +121,14 @@ export function PhoneLoginBackground({
   const alignedTranslateY =
     (waveProfile === "ponds" || waveAlign === "bottom" ? translateY : 0) +
     waveOffsetY;
+
+  if (appearance === "dark") {
+    return (
+      <View style={[styles.root, styles.rootDark]}>
+        <View style={styles.content}>{children}</View>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.root}>
@@ -156,6 +172,9 @@ const styles = StyleSheet.create({
     // Keep the wave pinned to the viewport — prevent document/page scroll on web.
     minHeight: 0,
     ...(Platform.OS === "web" ? ({ height: "100%" } as object) : null),
+  },
+  rootDark: {
+    backgroundColor: AUTH_DARK_BACKGROUND,
   },
   waveClip: {
     position: "absolute",

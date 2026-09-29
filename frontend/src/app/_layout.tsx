@@ -34,9 +34,10 @@ export default function RootLayout() {
   const [authReady, setAuthReady] = useState(false);
 
   useEffect(() => {
-    loadStoredLanguage();
     let mounted = true;
-    void initializeAuthSession().finally(() => {
+    // Resolve the saved language before the first screen renders so Ask Prana
+    // never paints English and then switches to Hindi/Telugu.
+    void Promise.all([loadStoredLanguage(), initializeAuthSession()]).finally(() => {
       if (mounted) setAuthReady(true);
     });
     return () => {
@@ -58,7 +59,9 @@ export default function RootLayout() {
     const loginFlowRoute =
       pathname === "/" ||
       pathname === "/phone-login" ||
-      pathname === "/verify-otp";
+      pathname === "/verify-otp" ||
+      // Email-login code entry happens before there is a session.
+      pathname === "/verify-email";
 
     let mounted = true;
     const blockDeletedAccount = async () => {
@@ -72,6 +75,11 @@ export default function RootLayout() {
 
     void blockDeletedAccount();
     const unsubscribeAuth = subscribeToAuthSession((_session, event) => {
+      // No session (logout, expiry, direct URL): private screens must not stay open.
+      if (!_session?.user) {
+        if (!loginFlowRoute) router.replace("/phone-login" as never);
+        return;
+      }
       if (
         _session?.user &&
         (event === "SIGNED_IN" || event === "RESTORED" || event === "TOKEN_REFRESHED")

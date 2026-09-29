@@ -10,7 +10,8 @@ import {
 import {
   buildDocumentBytes,
   buildEmptyModelAnswerFallback,
-  buildExportFileName,
+  buildDocumentFileName,
+  findPreviousAnswerForExport,
   buildFallbackDiseasePrecautionsDocumentBody,
   buildFallbackEstimationDocumentBody,
   chatCaptionForGeneratedFile,
@@ -20,6 +21,11 @@ import {
   resolveRequestedDocumentFormat,
 } from "./lib/document-export.ts";
 import { buildSpeciesCultureReferenceContext } from "./lib/species-culture-reference.ts";
+import {
+  allowsShrimpReference,
+  buildAquacultureDomainContext,
+  detectAquacultureDomain,
+} from "./lib/aquaculture-domain.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -47,13 +53,24 @@ const UNSUPPORTED_FILE_ERROR =
   "Unsupported file type. Supported types are JPG, JPEG, PNG, WEBP, PDF, TXT, CSV, DOCX.";
 
 const ROLE_PROMPT = `
-You are Ask Prana, AquaPrana's friendly aquaculture assistant.
+You are Ask Prana, AquaPrana's friendly aquaculture intelligence assistant for BOTH shrimp aquaculture and freshwater fish farming (e.g. Rohu, Catla, Mrigal, Tilapia, Common Carp, Pangasius and other cultured fish).
+
+Identity and capabilities (when the farmer asks what you can do, what you specialize in, your expertise or main responsibility, which farming you support, or whether you help with shrimp or fish):
+• Your specialization is aquaculture, covering shrimp farming AND fish farming as equal, first-class areas. Never say or imply that you are mainly, primarily, especially or only a shrimp assistant.
+• Shrimp farming: Vannamei and black tiger culture — pond preparation, stocking, DOC, feeding and feed calculation, feed trays, FCR, growth, biomass, survival, water quality (DO, pH, temperature, salinity, alkalinity, ammonia, nitrite), aeration, probiotics/water management, disease risk and biosecurity, mortality, partial/full harvest, and shrimp photo review.
+• Fish farming: Rohu, Catla, Mrigal, Tilapia, Common Carp, Pangasius and other cultured freshwater fish — pond preparation, stocking density, fingerlings, feeding and feed calculation, FCR, growth, biomass, survival, water quality, aeration, fish health and disease prevention, biosecurity, composite/polyculture and species compatibility, production and economics, partial/full harvest.
+• Main responsibility: practical aquaculture decision support — using the pond, culture, water-quality, feeding, health and production information available to guide the farmer.
+• Answer the farmer's actual capability question in your own words (do not recite a fixed script); keep it short unless they ask for detail, and mention both shrimp and fish. In Telugu mention రొయ్యల పెంపకం and చేపల పెంపకం (e.g. రోహు, కట్ల, మ్రిగాల్, తిలాపియా, కామన్ కార్ప్, పంగాసియస్); in Hindi mention झींगा पालन and मछली पालन (e.g. रोहू, कतला, मृगल, तिलापिया, कॉमन कार्प, पंगेसियस).
+• If earlier replies in this conversation described you as shrimp-focused, do not repeat that; describe the full aquaculture scope.
+• You may answer brief general questions, but aquaculture (shrimp and fish) is your area of expertise.
 
 Speak directly to the farmer in the language of their CURRENT question (Telugu question → Telugu answer, English question → English answer). Use natural, everyday wording and short sentences. Avoid unnecessarily formal translations.
 
 In voice conversations, normally answer in two to four short sentences. Give the useful answer first, then ask one focused question if more information is needed. Provide longer explanations when requested.
 
 Remember relevant details within the conversation, including selected pond, species, culture day, stocking count, shrimp weight, and the user's question. Use saved information only when the application supplies it and the user is authorized to access it.
+
+Identify the culture domain before answering: shrimp, freshwater fish, mixed, or general aquaculture. Use the species named in the current question first, then the species established earlier in the conversation (keep using it until the farmer changes topic), then the pond's recorded species. Never give shrimp recommendations (feed charts, DOC, check trays, shrimp water-quality limits, shrimp diseases) for a fish question, or fish advice for a shrimp question. Combine the two only for polyculture, integrated/mixed-species culture, or when the farmer asks for a comparison. If the question does not say shrimp or fish and the answer depends on it, give general aquaculture guidance and briefly ask which they farm.
 
 Distinguish vannamei from tiger shrimp. Never apply one species' feeding schedule to another without a verified basis.
 
@@ -304,7 +321,7 @@ Attachment rules:
 `;
 
 const CHART_TABLE_IMAGE_RULES = `
-You are Ask Prana analyzing an attached shrimp-farm chart or table photo for THIS pond only.
+You are Ask Prana analyzing an attached aquaculture (shrimp or fish) farm chart or table photo for THIS pond only.
 
 IMAGE READING RULES
 • Use ONLY what is visible in the attached image(s). Do not invent numbers, days, feed, ABW, FCR, or totals.
@@ -1033,7 +1050,18 @@ function detectQuestionLanguage(question: string): string | null {
 const LANGUAGE_RULE = (
   language: string,
   languageNotes?: string | null,
-) => `
+  locked = false,
+) => locked ? `
+Language rule (MANDATORY — highest priority for wording):
+The farmer selected ${language} as the Ask Prana app language. Write the ENTIRE farmer-facing answer in ${language}, even if the question, attachments, or earlier chat turns are in another language.
+- Headings, paragraphs, bullet points, checklists, tables, document text and follow-up questions must all be in ${language}. Never leave an English paragraph or bullet in a ${language} answer.
+- Technical terms and units (pH, DO, FCR, ABW, MQTT, RS485, Modbus, mg/L, ppm) and product/chemical names may stay in Latin script.
+- Do not switch languages because of English aquaculture terms or because templates in these instructions are written in English — translate the meaning into ${language}.
+Never answer in Portuguese or unrelated languages.
+${language === "Telugu" ? "Write Telugu answers in Telugu script (తెలుగు అక్షరాలు), not English paragraphs." : ""}
+${language === "Hindi" ? "Write Hindi answers in Devanagari script, not English paragraphs." : ""}
+${languageNotes?.trim() ? `Additional language notes: ${languageNotes.trim()}` : ""}
+` : `
 Language rule (MANDATORY — highest priority for wording):
 Match the farmer's CURRENT question language exactly.
 - Telugu question → entire answer in Telugu (తెలుగు script).
@@ -1702,6 +1730,7 @@ serve(async (req) => {
       farmerDisplayName,
       task,
       texts,
+      languageLock,
     } = body ?? {};
 
     const incomingAttachments = parseIncomingAttachments(attachments);
@@ -1712,7 +1741,12 @@ serve(async (req) => {
       : normalizeFarmerLanguage(dbLanguageRaw || "English");
     // Question script/language wins so Telugu questions never get English harvest essays.
     const detectedQuestionLanguage = detectQuestionLanguage(questionText);
-    const configuredLanguage = detectedQuestionLanguage || clientLanguage;
+    // The app sends languageLock when the farmer selected a language in Ask
+    // Prana; that selection is final and must not be re-detected from text.
+    const languageLocked = languageLock === true && Boolean(language);
+    const configuredLanguage = languageLocked
+      ? clientLanguage
+      : detectedQuestionLanguage || clientLanguage;
     const languageNotesText =
       typeof languageNotes === "string" ? languageNotes.trim() : "";
     const clientFarmerName =
@@ -1732,7 +1766,9 @@ serve(async (req) => {
       configuredLanguage,
       detectedQuestionLanguage,
       clientLanguage,
-      languageSource: detectedQuestionLanguage
+      languageSource: languageLocked
+        ? "client-locked"
+        : detectedQuestionLanguage
         ? "question-detect"
         : language
           ? "client-conversation"
@@ -1759,18 +1795,28 @@ serve(async (req) => {
       const apiKey = Deno.env.get("OPENAI_API_KEY");
       if (!apiKey) return jsonResponse({ error: "LLM API key is missing." }, 500);
       const target = clientLanguage === "Telugu" ? "Telugu (Telugu script)" : clientLanguage === "Hindi" ? "Hindi (Devanagari)" : "English";
-      const response = await fetch(OPENAI_RESPONSES_URL, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: OPENAI_MODEL,
-          instructions: `Translate every array item into ${target}. Preserve meaning, numbers, abbreviations, and item order. Return ONLY a JSON array of strings, with exactly ${sourceTexts.length} items.`,
-          input: JSON.stringify(sourceTexts),
-          reasoning: { effort: "low" },
-          max_output_tokens: Math.min(4000, sourceTexts.join(" ").length * 2 + 200),
-        }),
-      });
-      const data = await response.json() as Record<string, unknown>;
+      // Translation needs no deliberation: the lightest reasoning effort cuts
+      // latency substantially. Fall back to "low" if the model rejects it.
+      const requestTranslation = (effort: "minimal" | "low") =>
+        fetch(OPENAI_RESPONSES_URL, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: OPENAI_MODEL,
+            instructions: `Translate every array item fully into ${target}; no item may remain in its original language. Items are aquaculture chat titles, previews, questions and answers (including error messages). Preserve meaning, numbers, markdown formatting (headings, bullets, bold, tables), line breaks, and item order. Technical terms and units (pH, DO, FCR, ABW, MQTT, RS485, Modbus, mg/L, ppm) may stay in Latin script. Return ONLY a JSON array of strings, with exactly ${sourceTexts.length} items.`,
+            input: JSON.stringify(sourceTexts),
+            reasoning: { effort },
+            // Indic scripts need several tokens per character, and reasoning
+            // tokens share this budget; a tight budget truncates the JSON.
+            max_output_tokens: Math.min(16000, sourceTexts.join(" ").length * 4 + 1500),
+          }),
+        });
+      let response = await requestTranslation("minimal");
+      let data = await response.json() as Record<string, unknown>;
+      if (response.status === 400 && /reasoning|effort/i.test(JSON.stringify(data))) {
+        response = await requestTranslation("low");
+        data = await response.json() as Record<string, unknown>;
+      }
       if (!response.ok) {
         const parsed = parseOpenAIError(response.status, data);
         return jsonResponse({ error: parsed.message }, parsed.httpStatus);
@@ -1851,6 +1897,13 @@ serve(async (req) => {
           .map((turn) => `${turn.role ?? "user"}: ${turn.text ?? ""}`)
           .join("\n")
       : "";
+    // The farmer's own recent messages establish the species/culture topic.
+    const recentUserTurns = Array.isArray(conversationHistory)
+      ? (conversationHistory as ConversationTurn[])
+          .slice(-6)
+          .filter((turn) => (turn.role ?? "user") === "user" && typeof turn.text === "string")
+          .map((turn) => turn.text as string)
+      : [];
 
     const imageCount = successfulAttachments.filter((item) =>
       item.openAIImageIncluded
@@ -1862,7 +1915,7 @@ serve(async (req) => {
       (imageCount && fileCount
         ? "Please analyze the attached images and documents."
         : imageCount
-          ? "Analyze the attached shrimp-farm chart or table image in detail. Follow the chart/table image reading steps. Do not invent unreadable numbers."
+          ? "Analyze the attached farm chart or table image in detail. Follow the chart/table image reading steps. Do not invent unreadable numbers."
           : fileCount
             ? "Please analyze the attached file(s)."
             : "Please answer the farmer.");
@@ -2011,17 +2064,25 @@ Deliver the FULL useful answer in that layout now. Do not switch back to plain p
     if (isGeneric) {
       const genericHealth = !chartTableImage && (currentHasImage || healthQuestion);
       const includeAttachments = currentHasImage || currentHasFile || genericHealth;
-      const speciesCultureRef = buildSpeciesCultureReferenceContext({
+      const cultureDomain = detectAquacultureDomain({
         question: farmerQuestion,
-        pondSpecies: null,
-        noRecordsJoin: false,
+        recentUserTurns,
       });
+      console.log("[ask-prana] culture domain", cultureDomain);
+      const cultureDomainContext = buildAquacultureDomainContext(cultureDomain);
+      const speciesCultureRef = allowsShrimpReference(cultureDomain, true)
+        ? buildSpeciesCultureReferenceContext({
+          question: farmerQuestion,
+          pondSpecies: null,
+          noRecordsJoin: false,
+        })
+        : null;
       systemPrompt = `
 ${ROLE_PROMPT}
 
 Mode: Generic Assistant. Pond records: none.
 
-${LANGUAGE_RULE(configuredLanguage, languageNotesText)}
+${LANGUAGE_RULE(configuredLanguage, languageNotesText, languageLocked)}
 ${FARMER_NAME_RULE(farmerNameForPrompt)}
 ${OUTPUT_STYLE_RULE}
 ${RESPONSE_FORMAT_RULES}
@@ -2051,7 +2112,7 @@ Farmer display name: ${farmerNameForPrompt || "unavailable"}
 Attachment Status:
 ${attachmentStatus}
 
-${speciesCultureRef ? `${speciesCultureRef}\n` : ""}
+${cultureDomainContext ? `${cultureDomainContext}\n` : ""}${speciesCultureRef ? `${speciesCultureRef}\n` : ""}
 Recent Conversation:
 ${history || "none"}
 
@@ -2060,7 +2121,7 @@ ${farmerQuestion}
 ${documentExportInstruction}
 ${formatRequestInstruction}
 ${chartTableImageInstruction}
-OUTPUT LANGUAGE REQUIREMENT: The farmer's CURRENT question must drive the reply language. Answer only that question, and write the FULL answer in ${configuredLanguage}. If ${configuredLanguage} is Telugu, use Telugu script for the whole reply (not English). If it is English, reply in English. Do not copy an earlier English/Telugu chat turn's language when it differs from this question.
+OUTPUT LANGUAGE REQUIREMENT: ${languageLocked ? `The farmer selected ${configuredLanguage} as the app language; it overrides the question's language.` : "The farmer's CURRENT question must drive the reply language."} Answer only that question, and write the FULL answer in ${configuredLanguage}. If ${configuredLanguage} is Telugu, use Telugu script for the whole reply (not English). If it is English, reply in English. Do not copy an earlier English/Telugu chat turn's language when it differs from this question.
 If this request has a chart/table image, follow CHART_TABLE_IMAGE_RULES (Steps 1–6). Do not invent unreadable numbers.
 If this request has a shrimp-health image (not a chart), describe visible signs first, then interpret. Do not invent pond conditions. Do not force headings. State that no pond-specific records were used.
 If this is a follow-up after a shrimp-photo conversation, continue that visual assessment without inventing a new photo.
@@ -2194,13 +2255,22 @@ If this is a normal general question with no prior health context, do not invent
         cycle?.current_abw_g == null &&
         cycle?.current_biomass_kg == null &&
         cycle?.current_feed_per_day_kg == null;
-      const speciesCultureRef = buildSpeciesCultureReferenceContext({
+      const cultureDomain = detectAquacultureDomain({
         question: farmerQuestion,
-        pondSpecies:
-          typeof cycle?.species === "string" ? cycle.species : null,
-        noRecordsJoin,
-        thinFarmData,
+        recentUserTurns,
+        pondSpecies: typeof cycle?.species === "string" ? cycle.species : null,
       });
+      console.log("[ask-prana] culture domain", cultureDomain);
+      const cultureDomainContext = buildAquacultureDomainContext(cultureDomain);
+      const speciesCultureRef = allowsShrimpReference(cultureDomain, false)
+        ? buildSpeciesCultureReferenceContext({
+          question: farmerQuestion,
+          pondSpecies:
+            typeof cycle?.species === "string" ? cycle.species : null,
+          noRecordsJoin,
+          thinFarmData,
+        })
+        : null;
 
       const pondContext = `
 Mode: pond
@@ -2253,7 +2323,7 @@ ${checkTrayTrend}
 Existing-cycle / no-history baseline:
 ${baselineContext}
 
-${speciesCultureRef ? `${speciesCultureRef}\n` : ""}
+${cultureDomainContext ? `${cultureDomainContext}\n` : ""}${speciesCultureRef ? `${speciesCultureRef}\n` : ""}
 Feed schedule (client-only, not in pond_logs):
 ${feedScheduleSummary ?? "unavailable"}
 
@@ -2272,7 +2342,7 @@ ${ROLE_PROMPT}
 
 Mode: Pond advisor. Use this pond's supplied data. Do not ask the farmer to select a pond.
 
-${LANGUAGE_RULE(configuredLanguage, languageNotesText)}
+${LANGUAGE_RULE(configuredLanguage, languageNotesText, languageLocked)}
 ${FARMER_NAME_RULE(farmerNameForPrompt)}
 ${OUTPUT_STYLE_RULE}
 ${RESPONSE_FORMAT_RULES}
@@ -2295,7 +2365,7 @@ ${farmerQuestion}
 ${documentExportInstruction}
 ${formatRequestInstruction}
 ${chartTableImageInstruction}
-OUTPUT LANGUAGE REQUIREMENT: The farmer's CURRENT question must drive the reply language. Answer only that question, and write the FULL answer in ${configuredLanguage}. If ${configuredLanguage} is Telugu, use Telugu script for the whole reply (not English). If it is English, reply in English. Do not copy an earlier English/Telugu chat turn's language when it differs from this question.
+OUTPUT LANGUAGE REQUIREMENT: ${languageLocked ? `The farmer selected ${configuredLanguage} as the app language; it overrides the question's language.` : "The farmer's CURRENT question must drive the reply language."} Answer only that question, and write the FULL answer in ${configuredLanguage}. If ${configuredLanguage} is Telugu, use Telugu script for the whole reply (not English). If it is English, reply in English. Do not copy an earlier English/Telugu chat turn's language when it differs from this question.
 Use only pond values relevant to this question.
 For current pond-condition / water-quality questions, prioritize latest DO, pH, temperature, salinity, ammonia, nitrite if available, feed, mortality, and data age. Do not mention DOC or lecture about culture-age consistency.
 If this request has a chart/table image, follow CHART_TABLE_IMAGE_RULES (Steps 1–6). Read visible numbers only; mark unreadable cells as "Not readable".
@@ -2310,6 +2380,137 @@ If this is a normal water/feed question with no prior health context, do not men
     ];
     for (const attachment of successfulAttachments) {
       content.push(...attachment.parts);
+    }
+
+    // Packages an export answer into the requested file and returns the reply.
+    const packageDocumentExport = async (answer: string): Promise<Response> => {
+      // Always attempt packaging for export requests — never return "No response received."
+      let documentBody = answer;
+      if (isUnusableDocumentAnswer(documentBody) || !documentBody.trim()) {
+        documentBody = diseasePrecautionsExport
+          ? buildFallbackDiseasePrecautionsDocumentBody()
+          : buildFallbackEstimationDocumentBody();
+      }
+
+      try {
+        const format = requestedDocumentFormat ??
+          resolveRequestedDocumentFormat(farmerQuestion);
+        const mimeType = mimeForFormat(format);
+        const fileName = buildDocumentFileName(
+          documentBody,
+          farmerQuestion,
+          format,
+          pondNameForExport,
+        );
+        const bytes = await buildDocumentBytes(documentBody, format, wordExportContext);
+        const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
+        const sessionPart = isValidUuid(sessionId) ? sessionId : "session";
+        const filePath =
+          `documents/${trustedUserId}/generated/${sessionPart}/${Date.now()}-${safeName}`;
+
+        let uploadedBucket: string | null = null;
+        let lastUploadError: string | null = null;
+        for (const bucket of STORAGE_BUCKETS) {
+          const { error: uploadError } = await supabase.storage
+            .from(bucket)
+            .upload(filePath, bytes, {
+              contentType: mimeType,
+              upsert: false,
+            });
+          if (!uploadError) {
+            uploadedBucket = bucket;
+            break;
+          }
+          lastUploadError = uploadError.message;
+          console.error("[ask-prana] generated file upload failed", {
+            bucket,
+            message: uploadError.message,
+          });
+        }
+
+        if (!uploadedBucket) {
+          console.error("[ask-prana] document generation storage failed:", lastUploadError);
+          return jsonResponse(
+            {
+              error:
+                "Could not store the generated document. Please try again in a moment.",
+            },
+            500,
+          );
+        }
+
+        const { data: signed, error: signedError } = await supabase.storage
+          .from(uploadedBucket)
+          // `download` makes browsers save it under the readable file name.
+          .createSignedUrl(filePath, 60 * 60 * 24 * 7, { download: fileName });
+
+        if (signedError || !signed?.signedUrl) {
+          console.error("[ask-prana] signed URL failed:", signedError?.message);
+          return jsonResponse(
+            {
+              error:
+                "Document was generated but the download link could not be created. Please try again.",
+            },
+            500,
+          );
+        }
+
+        console.log("[ask-prana] generated document ready", {
+          format,
+          fileName,
+          path: filePath,
+          bucket: uploadedBucket,
+          byteSize: bytes.byteLength,
+        });
+
+        return jsonResponse({
+          answer: chatCaptionForGeneratedFile(format, configuredLanguage),
+          generatedFile: {
+            type: "file",
+            fileName,
+            mimeType,
+            path: filePath,
+            url: signed.signedUrl,
+            byteSize: bytes.byteLength,
+            format,
+          },
+        });
+      } catch (docError) {
+        const message = docError instanceof Error
+          ? docError.message
+          : "Document generation failed.";
+        console.error("[ask-prana] document generation error:", message);
+        // Last resort: still answer the farmer — never "No response received."
+        // Friendly message only; the technical error is logged above.
+        const formatLabel =
+          requestedDocumentFormat === "xlsx"
+            ? "Excel file"
+            : requestedDocumentFormat === "pdf"
+            ? "PDF document"
+            : "Word document";
+        const retryHint =
+          configuredLanguage === "Telugu"
+            ? `క్షమించండి, ${formatLabel} ఇప్పుడు తయారు చేయలేకపోయాను. దయచేసి మళ్లీ ప్రయత్నించండి.`
+            : configuredLanguage === "Hindi"
+            ? `क्षमा करें, अभी ${formatLabel} नहीं बना पाया। कृपया फिर से प्रयास करें।`
+            : `Sorry, I couldn't generate the ${formatLabel} right now. Please try again.`;
+        return jsonResponse({
+          answer: retryHint,
+        });
+      }
+    };
+
+    // "Give me this in Word" with no new topic: package the previous Ask Prana
+    // answer exactly as written instead of asking the model to rewrite it.
+    const previousAnswerForExport = documentExportQuestion
+      ? findPreviousAnswerForExport(farmerQuestion, conversationHistory, requestedDocumentFormat)
+      : null;
+    if (previousAnswerForExport) {
+      console.log("[ask-prana] exporting previous answer", {
+        format: requestedDocumentFormat,
+        length: previousAnswerForExport.length,
+      });
+      return await packageDocumentExport(previousAnswerForExport);
     }
 
     const controller = new AbortController();
@@ -2472,116 +2673,7 @@ If this is a normal water/feed question with no prior health context, do not men
       return jsonResponse({ answer });
     }
 
-    // Always attempt packaging for export requests — never return "No response received."
-    let documentBody = answer;
-    if (isUnusableDocumentAnswer(documentBody) || !documentBody.trim()) {
-      documentBody = diseasePrecautionsExport
-        ? buildFallbackDiseasePrecautionsDocumentBody()
-        : buildFallbackEstimationDocumentBody();
-    }
-
-    try {
-      const format = requestedDocumentFormat ??
-        resolveRequestedDocumentFormat(farmerQuestion);
-      const mimeType = mimeForFormat(format);
-      const fileName = buildExportFileName(
-        farmerQuestion,
-        format,
-        pondNameForExport,
-      );
-      const bytes = await buildDocumentBytes(documentBody, format, wordExportContext);
-      const safeName = fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
-      const sessionPart = isValidUuid(sessionId) ? sessionId : "session";
-      const filePath =
-        `documents/${trustedUserId}/generated/${sessionPart}/${Date.now()}-${safeName}`;
-
-      let uploadedBucket: string | null = null;
-      let lastUploadError: string | null = null;
-      for (const bucket of STORAGE_BUCKETS) {
-        const { error: uploadError } = await supabase.storage
-          .from(bucket)
-          .upload(filePath, bytes, {
-            contentType: mimeType,
-            upsert: false,
-          });
-        if (!uploadError) {
-          uploadedBucket = bucket;
-          break;
-        }
-        lastUploadError = uploadError.message;
-        console.error("[ask-prana] generated file upload failed", {
-          bucket,
-          message: uploadError.message,
-        });
-      }
-
-      if (!uploadedBucket) {
-        console.error("[ask-prana] document generation storage failed:", lastUploadError);
-        return jsonResponse(
-          {
-            error:
-              "Could not store the generated document. Please try again in a moment.",
-            detail: lastUploadError,
-          },
-          500,
-        );
-      }
-
-      const { data: signed, error: signedError } = await supabase.storage
-        .from(uploadedBucket)
-        .createSignedUrl(filePath, 60 * 60 * 24 * 7);
-
-      if (signedError || !signed?.signedUrl) {
-        console.error("[ask-prana] signed URL failed:", signedError?.message);
-        return jsonResponse(
-          {
-            error:
-              "Document was generated but the download link could not be created. Please try again.",
-          },
-          500,
-        );
-      }
-
-      console.log("[ask-prana] generated document ready", {
-        format,
-        fileName,
-        path: filePath,
-        bucket: uploadedBucket,
-        byteSize: bytes.byteLength,
-      });
-
-      return jsonResponse({
-        answer: chatCaptionForGeneratedFile(format, configuredLanguage),
-        generatedFile: {
-          type: "file",
-          fileName,
-          mimeType,
-          path: filePath,
-          url: signed.signedUrl,
-          byteSize: bytes.byteLength,
-          format,
-        },
-      });
-    } catch (docError) {
-      const message = docError instanceof Error
-        ? docError.message
-        : "Document generation failed.";
-      console.error("[ask-prana] document generation error:", message);
-      // Last resort: still answer the farmer — never "No response received."
-      const formatLabel =
-        requestedDocumentFormat === "xlsx"
-          ? "Excel file"
-          : "downloadable document";
-      const retryHint =
-        configuredLanguage === "Telugu"
-          ? `క్షమించండి, ${formatLabel} ఇప్పుడు తయారు కాలేదు. దయచేసి మళ్లీ అడగండి.`
-          : configuredLanguage === "Hindi"
-          ? `क्षमा करें, अभी ${formatLabel} नहीं बन पाया। कृपया फिर से पूछें।`
-          : `Sorry — I could not finish the ${formatLabel} just now. Please try again.`;
-      return jsonResponse({
-        answer: `${retryHint}${message ? ` (${message})` : ""}`,
-      });
-    }
+    return await packageDocumentExport(answer);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     const stack = err instanceof Error ? err.stack : undefined;

@@ -41,6 +41,7 @@ import {
   type AskPranaRequestContext,
 } from "../services/ask-prana";
 import { stopAskPranaSpeech } from "../lib/ask-prana-speech";
+import { clearAskPranaDisplayTranslations } from "../lib/ask-prana-display-translation";
 import {
   createAskPranaSession,
   deleteAskPranaSession,
@@ -705,6 +706,11 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
   );
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
+  /**
+   * Recently opened conversations (per user) so reopening one from History
+   * renders instantly while a fresh copy loads. Display-only; never written back.
+   */
+  const openedConversationCacheRef = useRef(new Map<string, ChatMessage[]>());
   const farmerName = displayName;
   const [authLoading, setAuthLoading] = useState(true);
 
@@ -1101,6 +1107,14 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
         setAuthLoading(false);
 
         if (!nextUserId) {
+          // Signed out: drop the previous user's unsent input and cached
+          // translations. The userId change below also resets the open
+          // conversation and invalidates in-flight replies (see scopeKey).
+          // Nothing is deleted from Supabase.
+          setDraft("");
+          setPendingAttachments([]);
+          clearAskPranaDisplayTranslations();
+          openedConversationCacheRef.current.clear();
           setPonds([]);
           setSelectedPondIdState((current) =>
             current === GENERIC_ASSISTANT_ID ? current : GENERIC_ASSISTANT_ID,
@@ -1288,19 +1302,31 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
           ? null
           : requestPondId;
 
-      setIsLoadingMessages(true);
+      const openStartedAt = Date.now();
+      const cacheKey = `${userId ?? ""}:${nextSessionId}`;
+      const cachedMessages = openedConversationCacheRef.current.get(cacheKey);
+      // Cached: show it now and refresh quietly; otherwise show the loader.
+      setIsLoadingMessages(!cachedMessages);
       sessionCreatePromiseRef.current = null;
       setActiveSessionId(nextSessionId);
       setDraft("");
       setPendingAttachments([]);
       setGenerationStopped(false);
-      const welcome = buildWelcomeMessage(farmerName);
-      setMessages([welcome]);
-      messagesRef.current = [welcome];
+      const initialMessages = cachedMessages ?? [buildWelcomeMessage(farmerName)];
+      setMessages(initialMessages);
+      messagesRef.current = initialMessages;
 
       try {
-        const { pondId: sessionPondId, userId: sessionUserId, error: metaError } =
-          await getAskPranaSessionPondId(nextSessionId, userId ?? undefined);
+        // Session ownership/pond check and the message fetch are independent
+        // reads (both filtered by user/pond), so run them in parallel; the
+        // messages are only shown after the checks below pass.
+        const [
+          { pondId: sessionPondId, userId: sessionUserId, error: metaError },
+          fetchedMessages,
+        ] = await Promise.all([
+          getAskPranaSessionPondId(nextSessionId, userId ?? undefined),
+          fetchAskPranaMessages(nextSessionId, userId ?? undefined, expectedPondId),
+        ]);
 
         if (epoch !== pondLoadEpochRef.current) {
           return;
@@ -1340,19 +1366,7 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
           return;
         }
 
-        const { messages: storedMessages, error } =
-          await fetchAskPranaMessages(
-            nextSessionId,
-            userId ?? undefined,
-            expectedPondId,
-          );
-
-        if (epoch !== pondLoadEpochRef.current) {
-          return;
-        }
-        if (selectedPondIdRef.current !== requestPondId) {
-          return;
-        }
+        const { messages: storedMessages, error } = fetchedMessages;
 
         if (error) {
           console.log("[AskPranaChat] open conversation error:", error);
@@ -1365,6 +1379,23 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
           return;
         }
 
+        if (storedMessages.length > 0) {
+          const cache = openedConversationCacheRef.current;
+          cache.delete(cacheKey);
+          cache.set(cacheKey, storedMessages);
+          if (cache.size > 20) cache.delete(cache.keys().next().value as string);
+        }
+        if (__DEV__) {
+          console.log("[AskPranaChat] conversation opened", {
+            cacheHit: Boolean(cachedMessages),
+            messages: storedMessages.length,
+            fetchMs: Date.now() - openStartedAt,
+          });
+        }
+        // Don't clobber a turn the farmer started while the cached copy showed.
+        if (cachedMessages && messagesRef.current !== initialMessages) {
+          return;
+        }
         setDraft("");
         setMessages(
           storedMessages.length > 0

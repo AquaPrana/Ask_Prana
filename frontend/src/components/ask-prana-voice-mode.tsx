@@ -13,6 +13,7 @@ import {
 import Feather from "@expo/vector-icons/Feather";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { ASK_PRANA_FONT_FAMILY } from "../constants/ask-prana-typography";
+import { AskPranaLogo } from "./ask-prana-logo";
 import type { AskPranaRequestContext } from "../services/ask-prana";
 import {
   ASK_PRANA_LANGUAGE_OPTIONS,
@@ -418,7 +419,9 @@ export function AskPranaVoiceModeModal({
     >
       <View style={[styles.root, { paddingTop: insets.top + 12, paddingBottom: insets.bottom + 12 }]}>
         <View style={styles.header}>
-          <View>
+          <View style={styles.headerBrand}>
+            <AskPranaLogo size={36} decorative />
+            <View>
             <Text style={styles.title}>Ask Prana Voice</Text>
             <Pressable
               onPress={() => setLanguageMenuOpen((open) => !open)}
@@ -429,6 +432,7 @@ export function AskPranaVoiceModeModal({
               <Text style={styles.subtitle}>{languageLabel}</Text>
               <Feather name="chevron-down" size={14} color={colors.muted} />
             </Pressable>
+            </View>
           </View>
           <Pressable onPress={() => void handleEnd()} style={styles.iconBtn} accessibilityLabel="End voice">
             <Feather name="x" size={20} color={colors.white} />
@@ -556,6 +560,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
   },
+  headerBrand: { flexDirection: "row", alignItems: "center", gap: 10 },
   title: { color: colors.white, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 18, lineHeight: 23, fontWeight: "600" },
   subtitle: { color: colors.muted, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 13, lineHeight: 18, marginTop: 2, fontWeight: "500" },
   languagePicker: { flexDirection: "row", alignItems: "center", gap: 2 },

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Dimensions,
@@ -29,6 +29,7 @@ import * as Clipboard from "expo-clipboard";
 import Feather from "@expo/vector-icons/Feather";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useTranslation } from "react-i18next";
+import { AskPranaLogo } from "./ask-prana-logo";
 import type {
   AskPranaThinkingKind,
   ChatMessage,
@@ -944,7 +945,7 @@ function MessageActionRow({
   );
 }
 
-export function AskPranaChatMessageBubble({
+function AskPranaChatMessageBubbleComponent({
   message,
   isEditingUserMessage = false,
   onBeginEditUserMessage,
@@ -954,8 +955,11 @@ export function AskPranaChatMessageBubble({
   onRegenerateAssistantMessage,
   regenerateDisabled,
   onReadAloud,
+  isTranslating = false,
 }: {
   message: ChatMessage;
+  /** Selected-language text for this message is still on its way. */
+  isTranslating?: boolean;
   isEditingUserMessage?: boolean;
   onBeginEditUserMessage?: (messageId: string) => void;
   onCancelEditUserMessage?: () => void;
@@ -1178,6 +1182,7 @@ export function AskPranaChatMessageBubble({
 
     return (
       <View style={styles.assistantBlock}>
+        <AskPranaAssistantIdentity translating={isTranslating} />
         <View style={styles.assistantFileCard}>
           <View style={styles.assistantFileRow}>
             <View
@@ -1247,6 +1252,7 @@ export function AskPranaChatMessageBubble({
 
   return (
     <View style={styles.assistantBlock}>
+      <AskPranaAssistantIdentity translating={isTranslating} />
       <View style={styles.assistantBubble}>
         <AskPranaFormattedText text={message.text} color={colors.textDark} />
       </View>
@@ -1254,6 +1260,28 @@ export function AskPranaChatMessageBubble({
     </View>
   );
 }
+
+/** Assistant-only identity row; user messages never render this. */
+function AskPranaAssistantIdentity({ translating = false }: { translating?: boolean }) {
+  const { t } = useTranslation();
+  return (
+    <View style={styles.assistantIdentity}>
+      <AskPranaLogo size={24} decorative />
+      <Text style={styles.assistantIdentityName}>{t("askPrana.title")}</Text>
+      {translating ? (
+        <Text style={styles.assistantTranslating} accessibilityLiveRegion="polite">
+          {t("askPrana.translating")}
+        </Text>
+      ) : null}
+    </View>
+  );
+}
+
+/**
+ * Memoized: translation batches landing (or a language switch) re-render only
+ * the bubbles whose displayed message object actually changed.
+ */
+export const AskPranaChatMessageBubble = memo(AskPranaChatMessageBubbleComponent);
 
 function thinkingLabel(kind: AskPranaThinkingKind) {
   if (kind === "image") return "Analyzing image";
@@ -1289,13 +1317,17 @@ function AskPranaThinkingDots() {
 
 export function AskPranaThinkingBubble({
   kind,
+  label,
 }: {
   kind: AskPranaThinkingKind;
+  /** Overrides the default label, e.g. while a requested file is generated. */
+  label?: string | null;
 }) {
   return (
     <View style={styles.assistantBlock}>
+      <AskPranaAssistantIdentity />
       <View style={styles.thinkingRow}>
-        <Text style={styles.thinkingText}>{thinkingLabel(kind)}...</Text>
+        <Text style={styles.thinkingText}>{label ?? `${thinkingLabel(kind)}...`}</Text>
         <AskPranaThinkingDots />
       </View>
     </View>
@@ -1304,6 +1336,9 @@ export function AskPranaThinkingBubble({
 
 const styles = StyleSheet.create({
   assistantBlock: { width: "100%", gap: 6, alignItems: "flex-start" },
+  assistantIdentity: { flexDirection: "row", alignItems: "center", gap: 8 },
+  assistantTranslating: { color: colors.muted, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 12, lineHeight: 16, fontWeight: "500" },
+  assistantIdentityName: { color: colors.textDark, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 14, lineHeight: 20, fontWeight: "600" },
   assistantBubble: {
     backgroundColor: "transparent",
     maxWidth: "100%",

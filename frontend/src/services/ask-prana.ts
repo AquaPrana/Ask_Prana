@@ -26,7 +26,9 @@ export async function translateAskPranaHistory(
   texts: string[],
   language: "en" | "te" | "hi",
 ): Promise<string[]> {
-  if (language === "en" || texts.length === 0) return texts;
+  // English is translated too: chats typed in Hindi/Telugu must not leak into
+  // the English UI. Callers only send text that is not already in `language`.
+  if (texts.length === 0) return texts;
   const auth = await requireAskPranaAuth();
   const result = await supabase.functions.invoke("ask-prana", {
     body: { task: "translate-history", texts, language },
@@ -34,6 +36,9 @@ export async function translateAskPranaHistory(
   });
   if (result.error || !Array.isArray(result.data?.translations)) {
     throw new Error("Historical translation is unavailable.");
+  }
+  if (result.data.translations.length !== texts.length) {
+    throw new Error("Historical translation returned an incomplete batch.");
   }
   return result.data.translations.map((value: unknown, index: number) =>
     typeof value === "string" && value.trim() ? value.trim() : (() => { throw new Error(`Missing translation at index ${index}.`); })(),
@@ -398,6 +403,9 @@ export async function askPrana(
     conversationHistory: enriched.conversationHistory ?? [],
     attachments,
     language: await resolveAskPranaLanguage(enriched.language),
+    // The farmer's selected Ask Prana language is final for this turn; the Edge
+    // Function must not re-detect it from the question text.
+    languageLock: Boolean(enriched.voiceModeLanguageLock?.trim()),
     languageNotes:
       typeof enriched.languageNotes === "string" && enriched.languageNotes.trim()
         ? enriched.languageNotes.trim()

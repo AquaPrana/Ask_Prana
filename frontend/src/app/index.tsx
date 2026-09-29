@@ -2,8 +2,12 @@ import { useEffect } from "react";
 import { ActivityIndicator, View } from "react-native";
 import { useRootNavigationState, useRouter } from "expo-router";
 import { AUTH_SESSION_TIMEOUT_MS, waitForAuthReady, withTimeout } from "../lib/supabase";
-import { logout } from "../services/auth";
-import { ACCOUNT_DELETED_MESSAGE, isCurrentUserDeleted } from "../services/profile";
+import { completeEmailLinkSignIn, logout } from "../services/auth";
+import {
+  ACCOUNT_DELETED_MESSAGE,
+  EMAIL_NOT_REGISTERED_MESSAGE,
+  isCurrentUserDeleted,
+} from "../services/profile";
 import { Alert } from "react-native";
 
 export default function StartupScreen() {
@@ -16,8 +20,29 @@ export default function StartupScreen() {
     let mounted = true;
     const routeToAskPrana = async () => {
       try {
+        // Opened from an email sign-in link (web): finish or report it first.
+        const link = await completeEmailLinkSignIn();
+        if (!mounted) return;
+        if (link.error) {
+          router.replace({ pathname: "/phone-login", params: { authError: link.error } } as never);
+          return;
+        }
+
         const session = await waitForAuthReady();
         if (!mounted) return;
+
+        // Ask Prana accounts are created by phone OTP. A session without a phone
+        // (e.g. an email-only account) is not one: sign out, never use it.
+        if (session?.user && !session.user.phone) {
+          await logout();
+          if (mounted) {
+            router.replace({
+              pathname: "/phone-login",
+              params: { authError: EMAIL_NOT_REGISTERED_MESSAGE },
+            } as never);
+          }
+          return;
+        }
 
         if (session?.user) {
           const deleted = await withTimeout(

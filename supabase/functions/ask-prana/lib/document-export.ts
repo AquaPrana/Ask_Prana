@@ -22,9 +22,22 @@ const PDF_MIME = "application/pdf";
 const XLSX_MIME =
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
+/** Telugu / Hindi words for a Word file or document (typed or STT forms). */
+const INDIC_WORD_DOCUMENT = /వర్డ్|డాక్యుమెంట్|డాక్యుమెంటు|డాక్ ఫైల్|वर्ड|डॉक्यूमेंट|डॉक्युमेंट|डाक्यूमेंट|दस्तावेज़|दस्तावेज/;
+
+/**
+ * "doc" as a file format ("give me in doc", "as a doc", "doc file") — not the
+ * shrimp culture-day abbreviation ("DOC 30", "at DOC", "what is the DOC").
+ */
+const DOC_FORMAT_REQUEST =
+  /\b(in|as|into|to)\s+(a\s+|an\s+|the\s+)?(\.?doc)\b(?!\s*[-:]?\s*\d)|\b\.?doc\s+(file|format)\b/;
+
 export function isDocumentExportQuestion(question: string): boolean {
   const q = question.toLowerCase();
   if (!q.trim()) return false;
+
+  if (DOC_FORMAT_REQUEST.test(q)) return true;
+  if (INDIC_WORD_DOCUMENT.test(question)) return true;
 
   // Telugu / Hindi script mentions of Excel / downloadable sheet (common STT+typed forms)
   if (/ఎక్సెల్|ఎక్సెల్‌|एक्सेल|एक्सल/.test(question)) return true;
@@ -145,6 +158,7 @@ export function resolveRequestedDocumentFormat(question: string): DocumentFormat
     q.search(/\bdoc\b(?!\w)/),
     // Generic "document" without Excel/PDF → Word (.docx)
     q.search(/\bdocument\b/),
+    question.search(INDIC_WORD_DOCUMENT),
   );
 
   const candidates: Array<{ format: DocumentFormat; idx: number }> = [];
@@ -1017,4 +1031,142 @@ export function buildEmptyModelAnswerFallback(
     return "क्षमा करें, इस बार पूरा उत्तर नहीं बन पाया। कृपया फिर से पूछें — मैं आपकी मदद करूँगा।";
   }
   return "Sorry — I could not finish that answer just now. Please ask again and I will help with your question.";
+}
+
+// ---------------------------------------------------------------------------
+// "Give me this in Word" — convert the previous answer, and file naming
+// ---------------------------------------------------------------------------
+
+const REFERS_TO_PREVIOUS =
+  /\b(this|that|it|above|previous|last|same|everything|all\s+(of\s+)?(this|that|the\s+above|details)|(the|your)\s+(answer|response|reply))\b/i;
+const REFERS_TO_PREVIOUS_INDIC = ["ఇది", "ఇదే", "దీన్ని", "దీనిని", "పైది", "పై సమాధానం", "ముందు", "इसे", "इसको", "यह", "यही", "ऊपर", "पिछल"];
+/** A new subject in the request means the model must write a new document. */
+const NEW_TOPIC = /\b(about|on|for|regarding|explain|what|why|how|which|when|list|guide\s+to)\b|గురించి|ఏమిటి|ఎలా|ఎందుకు|के\s+बारे\s+में|क्या|कैसे|क्यों/i;
+
+/**
+ * True for short follow-ups such as "Give me this in Word", "ఇది నాకు వర్డ్
+ * డాక్యుమెంట్‌లో ఇవ్వండి" or "इसे Word document में दें" that only ask to
+ * package the previous answer.
+ */
+export function isConvertPreviousAnswerRequest(question: string): boolean {
+  const q = question.trim();
+  if (!q || q.length > 140) return false;
+  const refersBack =
+    REFERS_TO_PREVIOUS.test(q) || REFERS_TO_PREVIOUS_INDIC.some((word) => q.includes(word));
+  return refersBack && !NEW_TOPIC.test(q);
+}
+
+const GENERATED_FILE_MARKER = /^\s*\[Generated downloadable file:/;
+
+/**
+ * The most recent substantial assistant answer (verbatim) when the farmer asks
+ * to package it; null when a new document must be written instead.
+ */
+export function findPreviousAnswerForExport(
+  question: string,
+  conversationHistory: unknown,
+  format: DocumentFormat | null,
+): string | null {
+  // Excel needs SHEET/TSV structure, so the model builds it; Word/PDF reuse prose.
+  if (format === "xlsx" || !isConvertPreviousAnswerRequest(question)) return null;
+  if (!Array.isArray(conversationHistory)) return null;
+  for (let index = conversationHistory.length - 1; index >= 0; index -= 1) {
+    const turn = conversationHistory[index] as { role?: unknown; text?: unknown } | null;
+    if (turn?.role !== "assistant" || typeof turn.text !== "string") continue;
+    const text = turn.text.trim();
+    // A previous file caption holds no content to convert — let the model write it.
+    if (GENERATED_FILE_MARKER.test(text)) return null;
+    return text.length >= 80 ? text : null;
+  }
+  return null;
+}
+
+const SMALL_TITLE_WORDS = new Set(["a", "an", "and", "as", "at", "by", "for", "in", "of", "on", "or", "the", "to", "vs", "with"]);
+
+function toTitleCase(title: string): string {
+  const allCaps = title === title.toUpperCase();
+  return title
+    .split(/\s+/)
+    .map((word, index) => {
+      // Keep acronyms / units (DO, FCR, pH, RAS) unless the whole title is shouted.
+      if (!allCaps && /[A-Z]/.test(word.slice(1))) return word;
+      const lower = word.toLowerCase();
+      if (index > 0 && SMALL_TITLE_WORDS.has(lower)) return lower;
+      return lower.charAt(0).toUpperCase() + lower.slice(1);
+    })
+    .join(" ");
+}
+
+/** Safe on Windows, Android, iOS and web: no reserved characters, bounded length. */
+function sanitizeDisplayFileName(name: string): string {
+  return name
+    .replace(/[<>:"/\|?*\u0000-\u001F]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^[.\s]+|[.\s]+$/g, "")
+    .slice(0, 80)
+    .trim();
+}
+
+/** The document's own title line, when it is a usable Latin-script title. */
+function titleFromDocumentBody(body: string): string | null {
+  for (const rawLine of body.replace(/\r\n/g, "\n").split("\n")) {
+    const line = rawLine.replace(/^#{1,6}\s*/, "").replace(/\*\*|__/g, "").replace(/^title\s*:\s*/i, "").trim();
+    if (!line) continue;
+    if (/^SHEET:/i.test(line) || line.includes("\t") || line.startsWith("|")) return null;
+    const letters = (line.match(/[A-Za-z]/g) || []).length;
+    const indic = (line.match(/[ऀ-ॿఀ-౿]/g) || []).length;
+    const looksLikeTitle =
+      line.length >= 6 && line.length <= 90 && letters >= 6 && indic === 0 && !/[.!?,;]$/.test(line);
+    return looksLikeTitle ? line : null;
+  }
+  return null;
+}
+
+/** Topic keywords (English/Telugu/Hindi) for bodies without a Latin title. */
+const TOPIC_FILE_NAMES: Array<[RegExp, string]> = [
+  [/disease|వ్యాధి|రోగ|रोग|बीमारी/i, "Diseases and Precautions"],
+  [/water\s*quality|నీటి\s*నాణ్యత|पानी\s*की\s*गुणवत्ता/i, "Water Quality Management"],
+  [/feed|మేత|దాణా|चारा|फ़ीड|फीड/i, "Feeding Management"],
+  [/harvest|పట్టుబడి|హార్వెస్ట్|हार्वेस्ट|कटाई/i, "Harvest Guide"],
+  [/stocking|సీడ్|బీజ|स्टॉकिंग/i, "Stocking Guide"],
+  [/prepar|తయారీ|तैयारी/i, "Pond Preparation"],
+];
+
+const SPECIES_FILE_NAMES: Array<[RegExp, string]> = [
+  [/rohu|రోహు|रोहू/i, "Rohu"],
+  [/catla|కట్ల|कतला/i, "Catla"],
+  [/mrigal|మ్రిగాల్|मृगल/i, "Mrigal"],
+  [/tilapia|తిలాపియా|तिलापिया/i, "Tilapia"],
+  [/common\s*carp|कॉमन\s*कार्प/i, "Common Carp"],
+  [/pangasius|basa|పంగాసియస్|पंगास/i, "Pangasius"],
+  [/vannamei|వెనామీ|वनामी/i, "Vannamei"],
+  [/shrimp|prawn|రొయ్య|झींगा/i, "Shrimp"],
+  [/fish|చేప|मछली/i, "Fish"],
+];
+
+/**
+ * Meaningful download name, e.g. "Fish Culture Diseases and Precautions.docx".
+ * Order: the document's own title → species + topic from the request/body →
+ * the existing pond/topic naming.
+ */
+export function buildDocumentFileName(
+  documentBody: string,
+  question: string,
+  format: DocumentFormat,
+  pondName?: string | null,
+): string {
+  const title = format === "xlsx" ? null : titleFromDocumentBody(documentBody);
+  let base = title ? sanitizeDisplayFileName(toTitleCase(title)) : "";
+  if (!base) {
+    const haystack = `${question}\n${documentBody.slice(0, 600)}`;
+    const species = SPECIES_FILE_NAMES.find(([re]) => re.test(haystack))?.[1];
+    const topic = TOPIC_FILE_NAMES.find(([re]) => re.test(haystack))?.[1];
+    if (species || topic) {
+      base = sanitizeDisplayFileName(
+        [species, topic ?? (species ? "Farming Guide" : "")].filter(Boolean).join(" "),
+      );
+    }
+  }
+  return base ? `${base}.${format}` : buildExportFileName(question, format, pondName);
 }
