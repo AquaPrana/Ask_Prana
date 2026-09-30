@@ -28,15 +28,10 @@ import { saveFarmerProfile } from "../services/local-profile";
 import { useProfile } from "../context/profile-context";
 import { supabase } from "../lib/supabase";
 import { useRouter, useLocalSearchParams } from "expo-router";
-import {
-  SafeAreaView,
-  useSafeAreaInsets,
-} from "react-native-safe-area-context";
+import { SafeAreaView } from "react-native-safe-area-context";
 import {
   AUTH_DARK_BACKGROUND,
   PhoneLoginBackground,
-  usePhoneLoginWaveClipHeight,
-  usePhoneLoginWaveInset,
 } from "../components/phone-login-background";
 
 const colors = {
@@ -81,11 +76,7 @@ const SMS_OTP_EXPIRY_SECONDS = 5 * 60;
 export default function VerifyOtpScreen() {
   const router = useRouter();
   const { applyProfileUpdate } = useProfile();
-  const insets = useSafeAreaInsets();
   const { width: windowWidth } = useWindowDimensions();
-  const waveProfile = "tall" as const;
-  const waveContentInset = usePhoneLoginWaveInset(waveProfile);
-  const waveClipHeight = usePhoneLoginWaveClipHeight(waveProfile);
   // The unified login screen passes { identifier, authMethod: "phone" };
   // `phone` is kept for older links into this screen.
   const params = useLocalSearchParams<{
@@ -341,22 +332,14 @@ export default function VerifyOtpScreen() {
     <View style={styles.root}>
       <StatusBar barStyle="light-content" backgroundColor={colors.background} />
 
-      <PhoneLoginBackground waveProfile={waveProfile} appearance="dark">
+      <PhoneLoginBackground appearance="dark">
         <KeyboardAvoidingView
           style={styles.keyboardView}
           behavior={Platform.OS === "ios" ? "padding" : undefined}
         >
-          <SafeAreaView style={styles.safeArea} edges={["bottom"]}>
+          <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}>
             <View style={styles.page}>
-              <View
-                style={[
-                  styles.headerArea,
-                  {
-                    height: Math.max(waveClipHeight, waveContentInset),
-                    paddingTop: insets.top + 8,
-                  },
-                ]}
-              >
+              <View style={styles.headerArea}>
                 <View style={styles.headerRow}>
                   <Pressable
                     onPress={() => {
@@ -523,7 +506,8 @@ const styles = StyleSheet.create({
     overflow: "hidden",
   },
   headerArea: {
-    justifyContent: "flex-start",
+    height: 60,
+    justifyContent: "center",
   },
   headerRow: {
     height: 44,
@@ -570,10 +554,14 @@ const styles = StyleSheet.create({
   },
   contentArea: {
     flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 20,
+    paddingVertical: 28,
   },
   content: {
-    paddingHorizontal: 20,
-    paddingTop: 56,
+    width: "100%",
+    maxWidth: 540,
   },
   eyebrow: {
     color: colors.teal,
@@ -583,11 +571,13 @@ const styles = StyleSheet.create({
     letterSpacing: 1.2,
     textTransform: "uppercase",
     marginBottom: 18,
+    textAlign: "center",
   },
   heading: {
     color: colors.text,
     fontWeight: "800",
     marginBottom: 16,
+    textAlign: "center",
   },
   sentTo: {
     color: colors.mutedText,
@@ -595,6 +585,7 @@ const styles = StyleSheet.create({
     lineHeight: 24,
     fontWeight: "600",
     marginBottom: 40,
+    textAlign: "center",
   },
   otpRowWrap: {
     position: "relative",
