@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { Platform } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useTranslation } from "react-i18next";
@@ -55,7 +55,6 @@ const MAX_CONCURRENT_BY_PRIORITY: Record<AskPranaTranslationPriority, number> = 
   background: 2,
   prefetch: 1,
 };
-const PREFETCH_DELAY_MS = 1_500;
 const RETRY_AFTER_MS = 5_000;
 const MAX_ATTEMPTS = 2;
 const STORAGE_PREFIX = "ask-prana:display-translations:v1:";
@@ -542,6 +541,18 @@ export function requestAskPranaDisplayTranslations(
 }
 
 /**
+ * Selects the language used to render the cache without scheduling work.
+ * This is intentionally separate from requestAskPranaDisplayTranslations so
+ * changing the picker can never be the cause of a translate-history call.
+ */
+export function setAskPranaDisplayLanguage(language: Language) {
+  if (language === activeLanguage) return;
+  startSwitchMetrics(activeLanguage, language);
+  activeLanguage = language;
+  checkSwitchMetrics();
+}
+
+/**
  * Selected-language display for Ask Prana content. The language comes from
  * i18next — the same source as every static Ask Prana label.
  */
@@ -554,34 +565,34 @@ export function useAskPranaDisplayTranslation(
     priorityCount?: number;
   },
 ) {
-  const prefetchOtherLanguages = options?.prefetchOtherLanguages ?? false;
   const priorityCount = options?.priorityCount;
   const { i18n } = useTranslation();
   const language = mapToAskPranaLanguageCode(i18n.resolvedLanguage);
   const storeVersion = useSyncExternalStore(subscribe, getVersion, getVersion);
   const signature = texts.join("␞");
 
-  useEffect(() => {
-    const sources = signature ? signature.split("␞") : [];
-    if (priorityCount == null || priorityCount >= sources.length) {
-      requestAskPranaDisplayTranslations(sources, language, priority);
-      return;
-    }
-    requestAskPranaDisplayTranslations(sources.slice(0, priorityCount), language, priority);
-    requestAskPranaDisplayTranslations(sources.slice(priorityCount), language, "background");
-  }, [language, priority, priorityCount, signature]);
+  const preparedSignatureRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!prefetchOtherLanguages || !signature) return;
-    // At idle, prepare the other languages so a later switch is instant.
-    const timer = setTimeout(() => {
-      const sources = signature.split("␞");
-      for (const other of LANGUAGES) {
-        if (other !== language) requestAskPranaDisplayTranslations(sources, other, "prefetch");
-      }
-    }, PREFETCH_DELAY_MS);
-    return () => clearTimeout(timer);
-  }, [language, prefetchOtherLanguages, signature]);
+    // A language click only selects a cache view; it must not start an API call.
+    setAskPranaDisplayLanguage(language);
+  }, [language]);
+
+  useEffect(() => {
+    if (!signature || preparedSignatureRef.current === signature) return;
+    preparedSignatureRef.current = signature;
+    const sources = signature.split("␞");
+    if (priorityCount == null || priorityCount >= sources.length) {
+      requestAskPranaDisplayTranslations(sources, language, priority);
+    } else {
+      requestAskPranaDisplayTranslations(sources.slice(0, priorityCount), language, priority);
+      requestAskPranaDisplayTranslations(sources.slice(priorityCount), language, "background");
+    }
+    // Prepare alternate languages in the background before a picker click.
+    for (const other of LANGUAGES) {
+      if (other !== language) requestAskPranaDisplayTranslations(sources, other, "prefetch");
+    }
+  }, [language, priority, priorityCount, signature]);
 
   const retryDue = useMemo(() => {
     if (storeVersion < 0 || !signature) return false;

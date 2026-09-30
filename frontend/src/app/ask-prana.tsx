@@ -60,7 +60,6 @@ import { speakAskPranaText, stopAskPranaSpeech } from "../lib/ask-prana-speech";
 import { type AskPranaRequestContext } from "../services/ask-prana";
 import { useAskPranaDisplayTranslation } from "../lib/ask-prana-display-translation";
 import { useProfile } from "../context/profile-context";
-import { updateCurrentUserProfile } from "../services/profile";
 
 const colors = {
   primary: "#4F8CF7",
@@ -270,7 +269,7 @@ export default function AskPranaScreen() {
     start: number;
     end: number;
   } | null>(null);
-  const { profile, refreshProfile, applyProfileUpdate } = useProfile();
+  const { refreshProfile } = useProfile();
   const insets = useSafeAreaInsets();
   const composerInputMaxHeight = useMemo(() => {
     // Android may either resize the layout or report the keyboard separately.
@@ -657,29 +656,18 @@ export default function AskPranaScreen() {
   );
 
   const handleSelectLanguage = useCallback(
-    async (code: AskPranaSpeechLanguageCode) => {
+    (code: AskPranaSpeechLanguageCode) => {
       const allowed =
         code === "en" || code === "te" || code === "hi" ? code : "en";
-      // i18next is the single UI language source; changing it rerenders every
-      // Ask Prana component (sidebar, chat, labels) in the same pass without
-      // touching stored chat messages.
-      await setAppLanguage(allowed);
+      // Apply the local language state first. Static labels, placeholders and
+      // the picker must not wait for storage, profile, or chat translation IO.
       setPreferredLanguage(allowed);
-      await saveAskPranaPreferredLanguage(allowed, { explicit: true });
-      // Reuse the existing users.language preference when an authenticated
-      // profile is available; local storage remains the fast offline fallback.
-      if (profile) {
-        const nextProfile = {
-          ...profile,
-          language: getAskPranaLanguageOption(allowed).llmLabel,
-        };
-        void updateCurrentUserProfile(nextProfile).then(({ error }) => {
-          if (!error) void applyProfileUpdate(nextProfile);
-        });
-      }
+      void setAppLanguage(allowed);
+      void saveAskPranaPreferredLanguage(allowed, { explicit: true });
       setLanguagePickerOpen(false);
+
     },
-    [applyProfileUpdate, profile],
+    [],
   );
 
   const handleBack = useCallback(() => {

@@ -10,7 +10,6 @@ import { isValidEmail, normalizeEmail, sendEmailLoginCode } from "../services/pr
 import {
   AUTH_DARK_BACKGROUND,
   PhoneLoginBackground,
-  usePhoneLoginWaveInset,
 } from "../components/phone-login-background";
 import { AskPranaLogo } from "../components/ask-prana-logo";
 import { PrimaryCtaGradientFill } from "../components/primary-cta-gradient";
@@ -113,7 +112,6 @@ export default function PhoneLoginScreen() {
   const router = useRouter();
   const { width: windowWidth } = useWindowDimensions();
   const insets = useSafeAreaInsets();
-  const waveContentInset = usePhoneLoginWaveInset();
   const [identifierInput, setIdentifierInput] = useState("");
   const [inputFocused, setInputFocused] = useState(false);
   const [isSendingOtp, setIsSendingOtp] = useState(false);
@@ -214,7 +212,7 @@ export default function PhoneLoginScreen() {
           style={styles.keyboardView}
           behavior={Platform.OS === "ios" ? "padding" : undefined}
         >
-          <SafeAreaView style={styles.safeArea} edges={["bottom"]}>
+          <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}>
             <ScrollView
               style={styles.scroll}
               contentContainerStyle={[
@@ -224,72 +222,67 @@ export default function PhoneLoginScreen() {
               keyboardShouldPersistTaps="handled"
               showsVerticalScrollIndicator={false}
             >
-              <View
-                style={{ height: waveContentInset }}
-                pointerEvents="none"
-                accessibilityElementsHidden
-                importantForAccessibility="no-hide-descendants"
-              />
+              <View style={styles.centerWrapper}>
+                <View style={styles.loginContainer}>
+                  <View style={styles.brandBlock}>
+                    <AskPranaLogo size={logoSize} />
+                  </View>
 
-              <View style={styles.brandBlock}>
-                <AskPranaLogo size={logoSize} />
-              </View>
-
-              <Text style={styles.welcomeLabel}>WELCOME</Text>
-              <Text
-                style={[
-                  styles.title,
-                  {
-                    fontSize: titleSize,
-                    lineHeight: Math.round(titleSize * 1.18),
-                  },
-                ]}
-              >
-                Enter your email or{"\n"}mobile number
-              </Text>
-              <Text style={styles.subtitle}>
-                We'll send you a one-time password to verify.
-              </Text>
-
-              <View style={styles.inputGroup}>
-                <Text style={styles.label}>Email or mobile number</Text>
-                <View
-                  style={[
-                    styles.inputContainer,
-                    inputFocused && styles.inputContainerFocused,
-                    errorMessage ? styles.inputContainerError : null,
-                  ]}
-                >
-                  <TextInput
-                    value={identifierInput}
-                    onChangeText={(value) => {
-                      setIdentifierInput(value);
-                      if (errorMessage) setErrorMessage(null);
-                    }}
-                    editable={!isSendingOtp}
-                    placeholder="Enter email or mobile number"
-                    placeholderTextColor={colors.placeholder}
-                    keyboardType="email-address"
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                    autoComplete="username"
-                    textContentType="username"
-                    style={styles.input}
-                    onFocus={() => setInputFocused(true)}
-                    onBlur={() => setInputFocused(false)}
-                    returnKeyType="send"
-                    onSubmitEditing={() => void handleSendOtp()}
-                    accessibilityLabel="Email or mobile number"
-                  />
-                </View>
-                {errorMessage ? (
-                  <Text style={styles.errorText} accessibilityLiveRegion="polite">
-                    {errorMessage}
+                  <Text style={styles.welcomeLabel}>WELCOME</Text>
+                  <Text
+                    style={[
+                      styles.title,
+                      {
+                        fontSize: titleSize,
+                        lineHeight: Math.round(titleSize * 1.18),
+                      },
+                    ]}
+                  >
+                    Enter your email or{"\n"}mobile number
                   </Text>
-                ) : null}
-              </View>
+                  <Text style={styles.subtitle}>
+                    We'll send you a one-time password to verify.
+                  </Text>
 
-              <View style={styles.actions}>
+                  <View style={styles.inputGroup}>
+                    <Text style={styles.label}>Email or mobile number</Text>
+                    <View
+                      style={[
+                        styles.inputContainer,
+                        inputFocused && styles.inputContainerFocused,
+                        errorMessage ? styles.inputContainerError : null,
+                      ]}
+                    >
+                      <TextInput
+                        value={identifierInput}
+                        onChangeText={(value) => {
+                          setIdentifierInput(value);
+                          if (errorMessage) setErrorMessage(null);
+                        }}
+                        editable={!isSendingOtp}
+                        placeholder="Enter email or mobile number"
+                        placeholderTextColor={colors.placeholder}
+                        keyboardType="email-address"
+                        autoCapitalize="none"
+                        autoCorrect={false}
+                        autoComplete="username"
+                        textContentType="username"
+                        style={styles.input}
+                        onFocus={() => setInputFocused(true)}
+                        onBlur={() => setInputFocused(false)}
+                        returnKeyType="send"
+                        onSubmitEditing={() => void handleSendOtp()}
+                        accessibilityLabel="Email or mobile number"
+                      />
+                    </View>
+                    {errorMessage ? (
+                      <Text style={styles.errorText} accessibilityLiveRegion="polite">
+                        {errorMessage}
+                      </Text>
+                    ) : null}
+                  </View>
+
+                  <View style={styles.actions}>
                 <Pressable
                   onPress={() => void handleSendOtp()}
                   disabled={!canSendOtp}
@@ -323,6 +316,8 @@ export default function PhoneLoginScreen() {
                 <Text style={styles.termsText}>
                   By continuing you agree to our Terms of Service
                 </Text>
+                  </View>
+                </View>
               </View>
             </ScrollView>
           </SafeAreaView>
@@ -360,9 +355,19 @@ const styles = StyleSheet.create({
     flexGrow: 1,
     paddingHorizontal: 20,
   },
+  centerWrapper: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 32,
+  },
+  loginContainer: {
+    width: "100%",
+    maxWidth: 540,
+  },
   brandBlock: {
     alignItems: "center",
-    marginBottom: 18,
+    marginBottom: 24,
   },
   welcomeLabel: {
     color: colors.primary,
@@ -372,11 +377,13 @@ const styles = StyleSheet.create({
     letterSpacing: 1.4,
     textTransform: "uppercase",
     marginBottom: 8,
+    textAlign: "center",
   },
   title: {
     color: colors.text,
     fontFamily: fonts.extraBold,
     marginBottom: 8,
+    textAlign: "center",
   },
   subtitle: {
     color: colors.textSoft,
@@ -384,6 +391,7 @@ const styles = StyleSheet.create({
     fontSize: 15,
     lineHeight: 21,
     marginBottom: 18,
+    textAlign: "center",
   },
   inputGroup: {
     gap: 8,

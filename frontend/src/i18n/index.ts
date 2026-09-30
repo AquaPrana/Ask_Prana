@@ -72,9 +72,16 @@ export async function loadStoredLanguage() {
   }
 }
 
-export async function setAppLanguage(language: AppLanguage) {
-  await AsyncStorage.setItem(LANGUAGE_STORAGE_KEY, language);
-  await i18n.changeLanguage(language);
+/**
+ * Changes the in-memory i18n language before persisting it.  A picker must
+ * never wait for AsyncStorage before its labels and selected value update.
+ */
+export function setAppLanguage(language: AppLanguage) {
+  const languageChanged = i18n.changeLanguage(language);
+  // Persistence is deliberately non-blocking.  The app has already switched
+  // language locally, and a failed local write should not undo that choice.
+  void AsyncStorage.setItem(LANGUAGE_STORAGE_KEY, language).catch(() => undefined);
+  return languageChanged;
 }
 
 export function getLanguageLabel(language?: string | null) {
