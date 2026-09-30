@@ -20,13 +20,13 @@ import { PrimaryCtaGradientFill } from "../components/primary-cta-gradient";
 import { PRIMARY_CTA_START } from "../constants/primary-cta";
 import { useProfile } from "../context/profile-context";
 import { subscribeToAuthSession, waitForAuthReady } from "../lib/supabase";
-import { logout } from "../services/auth";
+import { friendlyOtpVerifyError, logout } from "../services/auth";
 import { saveFarmerProfile } from "../services/local-profile";
 import {
   ACCOUNT_DELETED_MESSAGE,
   EMAIL_OTP_LENGTH,
+  ensureCurrentUserProfile,
   getCurrentUserEmailState,
-  getCurrentUserProfile,
   isCurrentUserDeleted,
   maskEmail,
   normalizeEmail,
@@ -54,6 +54,9 @@ const colors = {
 
 /** Supabase's default minimum interval between emails to the same address. */
 const RESEND_SECONDS = 60;
+
+/** Supabase Auth → Providers → Email → "Email OTP Expiration" (default 1 hour). */
+const EMAIL_OTP_EXPIRY_SECONDS = 3600;
 
 /**
  * Two uses of the same code screen:
@@ -93,6 +96,11 @@ export default function VerifyEmailScreen() {
   const requestLockRef = useRef(false);
   const verifyLockRef = useRef(false);
   const lastAutoVerifiedRef = useRef("");
+  // When the current code was sent; tells an expired code from a wrong one.
+  const codeSentAtRef = useRef(0);
+  useEffect(() => {
+    codeSentAtRef.current = Date.now();
+  }, []);
 
   const finish = useCallback(() => {
     if (returnBack && router.canGoBack()) router.back();
@@ -166,32 +174,41 @@ export default function VerifyEmailScreen() {
       setError(ACCOUNT_DELETED_MESSAGE);
       return;
     }
-    const { profile } = await getCurrentUserProfile();
-    if (profile?.name) {
-      await saveFarmerProfile({
-        name: profile.name,
-        state: profile.state ?? "",
-        district: profile.district ?? "",
-        language: profile.language ?? "",
-      });
-      await applyProfileUpdate({
-        name: profile.name,
-        state: profile.state ?? "",
-        district: profile.district ?? "",
-        language: profile.language ?? "",
-        phone: profile.phone ?? "",
-      });
+    // Existing account → its profile; new account → a profile row is created
+    // (keyed by auth.uid()) and the empty name sends it to profile setup.
+    const { profile, error: profileError } = await ensureCurrentUserProfile();
+    if (profileError) {
+      loginFinishedRef.current = false;
+      setError("Signed in, but your profile couldn't be loaded. Please try again.");
+      return;
     }
+    if (!profile?.name) {
+      router.replace("/edit-profile" as never);
+      return;
+    }
+    await saveFarmerProfile({
+      name: profile.name,
+      state: profile.state ?? "",
+      district: profile.district ?? "",
+      language: profile.language ?? "",
+    });
+    await applyProfileUpdate({
+      name: profile.name,
+      state: profile.state ?? "",
+      district: profile.district ?? "",
+      language: profile.language ?? "",
+      phone: profile.phone ?? "",
+    });
     router.replace("/ask-prana" as never);
   }, [applyProfileUpdate, router]);
 
   // The email may hold a Sign in link instead of a code. Clicking it opens
   // Ask Prana in another tab; the Supabase client shares that session with
-  // this tab, so continue here too (phone-created accounts only).
+  // this tab, so continue here too.
   useEffect(() => {
     if (!loginMode) return;
     const unsubscribe = subscribeToAuthSession((session) => {
-      if (session?.user?.phone) void finishEmailLogin();
+      if (session?.user) void finishEmailLogin();
     });
     return () => {
       unsubscribe();
@@ -213,7 +230,11 @@ export default function VerifyEmailScreen() {
       if (login.error) {
         verifyLockRef.current = false;
         setVerifying(false);
-        setError(login.error);
+        setError(
+          login.cause
+            ? friendlyOtpVerifyError(login.cause, codeSentAtRef.current, EMAIL_OTP_EXPIRY_SECONDS)
+            : login.error,
+        );
         return;
       }
       await finishEmailLogin();
@@ -268,6 +289,7 @@ export default function VerifyEmailScreen() {
       setError(resendError);
       return;
     }
+    codeSentAtRef.current = Date.now();
     setCode("");
     setNotice(`A new code was sent to ${maskEmail(targetEmail)}.`);
     setResendSeconds(RESEND_SECONDS);
@@ -281,8 +303,24 @@ export default function VerifyEmailScreen() {
       <PhoneLoginBackground waveProfile="tall" appearance="dark">
         <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === "ios" ? "padding" : undefined}>
           <SafeAreaView style={styles.flex} edges={["top", "bottom"]}>
+            <View style={styles.backRow}>
+              <Pressable
+                onPress={() => {
+                  // Email login is normally opened with push, but retain a
+                  // fallback for a directly opened verification URL.
+                  if (router.canGoBack()) router.back();
+                  else router.replace("/phone-login" as never);
+                }}
+                style={styles.backButton}
+                accessibilityRole="button"
+                accessibilityLabel="Change email or mobile number"
+                hitSlop={8}
+              >
+                <Text style={styles.backArrow}>←</Text>
+              </Pressable>
+            </View>
             <View style={styles.content}>
-              <Text style={styles.eyebrow}>{loginMode ? "LOGIN WITH EMAIL" : "EMAIL VERIFICATION"}</Text>
+              <Text style={styles.eyebrow}>{loginMode ? "SECURE VERIFICATION" : "EMAIL VERIFICATION"}</Text>
               <Text style={styles.heading}>Verify your email</Text>
 
               {verified ? (
@@ -296,7 +334,7 @@ export default function VerifyEmailScreen() {
               ) : (
                 <>
                   <Text style={styles.sentTo}>
-                    {sending ? "Sending a verification code to:" : "Enter the OTP sent to your email address:"}
+                    {sending ? "Sending a verification code to:" : "Enter the OTP sent to your email"}
                     {"\n"}
                     <Text style={styles.emailText}>{maskEmail(targetEmail)}</Text>
                   </Text>
@@ -331,7 +369,7 @@ export default function VerifyEmailScreen() {
                     <Text style={styles.noticeText}>
                       {Platform.OS === "web"
                         ? "If the email has a \"Sign in\" link instead of a code, click it — you'll be signed in automatically."
-                        : "If the email has a \"Sign in\" link instead of a code, please log in with your phone number on this device."}
+                        : "If the email has a \"Sign in\" link instead of a code, open it on this device or request a new code."}
                     </Text>
                   ) : null}
 
@@ -360,7 +398,7 @@ export default function VerifyEmailScreen() {
                     accessibilityRole="button"
                   >
                     <Text style={styles.skipText}>
-                      {loginMode ? "Use phone number instead" : returnBack ? "Cancel" : "Skip for now"}
+                      {loginMode ? "Change email or mobile number" : returnBack ? "Cancel" : "Skip for now"}
                     </Text>
                   </Pressable>
                 </>
@@ -408,6 +446,18 @@ function PrimaryButton({
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.background, overflow: "hidden" },
   flex: { flex: 1 },
+  backRow: { width: "100%", maxWidth: 520, alignSelf: "center", paddingHorizontal: 20, paddingTop: 12 },
+  backButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    backgroundColor: colors.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  backArrow: { color: colors.text, fontSize: 22, lineHeight: 24, fontWeight: "700", marginTop: -1 },
   content: { width: "100%", maxWidth: 520, alignSelf: "center", paddingHorizontal: 20, paddingTop: 72, gap: 12 },
   eyebrow: { color: colors.teal, fontSize: 14, lineHeight: 18, fontWeight: "800", letterSpacing: 1.2 },
   heading: { color: colors.text, fontSize: 30, lineHeight: 36, fontWeight: "800" },

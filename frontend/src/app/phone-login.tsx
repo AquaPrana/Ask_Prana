@@ -5,7 +5,7 @@ import {
   Geist_800ExtraBold,
   useFonts,
 } from "@expo-google-fonts/geist";
-import { isAuthSessionMissing, sendOTP } from "../services/auth";
+import { classifyOtpSendError, isAuthSessionMissing, sendOTP } from "../services/auth";
 import { isValidEmail, normalizeEmail, sendEmailLoginCode } from "../services/profile";
 import {
   AUTH_DARK_BACKGROUND,
@@ -47,8 +47,8 @@ const colors = {
   muted: "#A0A0A0",
   border: "#363636",
   inputBg: "#212121",
-  countryCodeBg: "#1B1B1B",
   placeholder: "#6F7777",
+  error: "#F87171",
   ctaDisabled: "#26302F",
   ctaDisabledText: "#7C8886",
   ctaGradientStart: PRIMARY_CTA_START,
@@ -63,127 +63,136 @@ const fonts = {
 
 const INDIAN_MOBILE_REGEX = /^[6-9]\d{9}$/;
 
-const isValidIndianMobile = (phone: string) => {
-  const cleanedPhone = phone.replace(/\D/g, "");
-  return INDIAN_MOBILE_REGEX.test(cleanedPhone);
-};
+const MESSAGES = {
+  empty: "Please enter your email or mobile number.",
+  invalid_email: "Please enter a valid email address.",
+  invalid_phone: "Please enter a valid 10-digit mobile number.",
+  failed: "Unable to send OTP. Please try again.",
+  rate_limited: "Too many OTP requests. Please wait a moment and try again.",
+  network: "Network error. Please check your connection and try again.",
+} as const;
 
-const isOtpRateLimitError = (message: string) =>
-  /security purposes|only request this after|after \d+ seconds|rate limit|too many requests/i.test(
-    message,
-  );
+type LoginIdentifier =
+  | { authMethod: "email"; identifier: string }
+  | { authMethod: "phone"; identifier: string };
+
+/**
+ * Works out whether the single login field holds an email or an Indian mobile
+ * number. Emails are normalized for Supabase; mobiles become +91XXXXXXXXXX and
+ * an existing +91 / 91 / leading 0 is never duplicated.
+ */
+function parseLoginIdentifier(
+  raw: string,
+): LoginIdentifier | { error: "empty" | "invalid_email" | "invalid_phone" } {
+  const value = raw.trim();
+  if (!value) return { error: "empty" };
+
+  // "@" or any letter means the user is typing an email, not a number.
+  if (value.includes("@") || /[a-z]/i.test(value)) {
+    return isValidEmail(value)
+      ? { authMethod: "email", identifier: normalizeEmail(value) }
+      : { error: "invalid_email" };
+  }
+
+  if (!/^\+?[\d\s\-().]+$/.test(value)) return { error: "invalid_phone" };
+  let digits = value.replace(/\D/g, "");
+  if (value.startsWith("+")) {
+    if (!digits.startsWith("91")) return { error: "invalid_phone" };
+    digits = digits.slice(2);
+  } else if (digits.length === 12 && digits.startsWith("91")) {
+    digits = digits.slice(2);
+  } else if (digits.length === 11 && digits.startsWith("0")) {
+    digits = digits.slice(1);
+  }
+  return INDIAN_MOBILE_REGEX.test(digits)
+    ? { authMethod: "phone", identifier: `+91${digits}` }
+    : { error: "invalid_phone" };
+}
 
 export default function PhoneLoginScreen() {
   const router = useRouter();
   const { width: windowWidth } = useWindowDimensions();
   const insets = useSafeAreaInsets();
   const waveContentInset = usePhoneLoginWaveInset();
-  const [phoneNumber, setPhoneNumber] = useState("");
+  const [identifierInput, setIdentifierInput] = useState("");
+  const [inputFocused, setInputFocused] = useState(false);
   const [isSendingOtp, setIsSendingOtp] = useState(false);
-  const [phoneFocused, setPhoneFocused] = useState(false);
   const isSendingOtpRef = useRef(false);
-  const phoneInputRef = useRef<TextInput>(null);
-  // Email login: only for an email already verified on an existing account.
-  const [email, setEmail] = useState("");
-  const [emailFocused, setEmailFocused] = useState(false);
   // A failed/unusable email sign-in link comes back here as ?authError=.
   const { authError } = useLocalSearchParams<{ authError?: string }>();
-  const [emailError, setEmailError] = useState<string | null>(
+  const [errorMessage, setErrorMessage] = useState<string | null>(
     typeof authError === "string" && authError ? authError : null,
   );
-  const [emailNotRegistered, setEmailNotRegistered] = useState(false);
-  const [isSendingEmailCode, setIsSendingEmailCode] = useState(false);
-  const isSendingEmailCodeRef = useRef(false);
   const [fontsLoaded] = useFonts({
     Geist_500Medium,
     Geist_700Bold,
     Geist_800ExtraBold,
   });
 
-  const cleanPhone = phoneNumber.replace(/\D/g, "");
-  const isPhoneValid = isValidIndianMobile(phoneNumber);
-  const showInvalidPhoneError =
-    cleanPhone.length === 10 && !isPhoneValid;
-  const canSendOtp = isPhoneValid && !isSendingOtp;
-  const canSendEmailCode = Boolean(email.trim()) && !isSendingEmailCode;
+  const canSendOtp = Boolean(identifierInput.trim()) && !isSendingOtp;
 
   const titleSize = Math.round(
     Math.min(32, Math.max(26, windowWidth * 0.078)),
   );
   const logoSize = Math.round(Math.min(112, Math.max(84, windowWidth * 0.24)));
 
-  const handlePhoneNumberChange = (value: string) => {
-    const digitsOnly = value.replace(/\D/g, "").slice(0, 10);
-    setPhoneNumber(digitsOnly);
-  };
+  const handleSendOtp = async () => {
+    if (isSendingOtpRef.current) return;
 
-  const handleContinue = async () => {
-    if (isSendingOtpRef.current || isSendingOtp) {
-      return;
-    }
-
-    if (!isValidIndianMobile(phoneNumber)) {
+    const parsed = parseLoginIdentifier(identifierInput);
+    if ("error" in parsed) {
+      setErrorMessage(MESSAGES[parsed.error]);
       return;
     }
 
     isSendingOtpRef.current = true;
     setIsSendingOtp(true);
+    setErrorMessage(null);
 
     try {
-      const fullPhone = `+91${phoneNumber}`;
+      if (parsed.authMethod === "email") {
+        // Existing email → login; new email → Supabase creates the account on verify.
+        const result = await sendEmailLoginCode(parsed.identifier);
+        if (result.error) {
+          setErrorMessage(MESSAGES[classifyOtpSendError(result.cause)]);
+          return;
+        }
+        router.push({
+          pathname: "/verify-email",
+          params: {
+            email: parsed.identifier,
+            mode: "login",
+            sent: "1",
+            identifier: parsed.identifier,
+            authMethod: "email",
+          },
+        } as never);
+        return;
+      }
 
-      const { error } = await sendOTP(fullPhone);
-
+      // Existing number → login; new number → Supabase creates the account on verify.
+      const { error } = await sendOTP(parsed.identifier);
       if (error) {
-        alert(
+        setErrorMessage(
           isAuthSessionMissing(error)
-            ? "Unable to send OTP. Please try again."
-            : isOtpRateLimitError(error.message)
-              ? "Please wait a few seconds before requesting another OTP."
-              : error.message,
+            ? MESSAGES.failed
+            : MESSAGES[classifyOtpSendError(error)],
         );
         return;
       }
-
       router.replace({
         pathname: "/verify-otp",
         params: {
-          phone: fullPhone,
+          phone: parsed.identifier,
+          identifier: parsed.identifier,
+          authMethod: "phone",
         },
       });
+    } catch (error) {
+      setErrorMessage(MESSAGES[classifyOtpSendError(error)]);
     } finally {
       isSendingOtpRef.current = false;
       setIsSendingOtp(false);
-    }
-  };
-
-  const handleSendEmailCode = async () => {
-    if (isSendingEmailCodeRef.current) return;
-    const address = normalizeEmail(email);
-    if (!isValidEmail(address)) {
-      setEmailNotRegistered(false);
-      setEmailError("Please enter a valid email address.");
-      return;
-    }
-    isSendingEmailCodeRef.current = true;
-    setIsSendingEmailCode(true);
-    setEmailError(null);
-    setEmailNotRegistered(false);
-    try {
-      // Never creates an account: unknown emails are refused by Supabase.
-      const result = await sendEmailLoginCode(address);
-      if (result.error) {
-        setEmailNotRegistered(result.notRegistered);
-        setEmailError(result.error);
-        return;
-      }
-      router.push({
-        pathname: "/verify-email",
-        params: { email: address, mode: "login", sent: "1" },
-      } as never);
-    } finally {
-      isSendingEmailCodeRef.current = false;
-      setIsSendingEmailCode(false);
     }
   };
 
@@ -206,7 +215,6 @@ export default function PhoneLoginScreen() {
           behavior={Platform.OS === "ios" ? "padding" : undefined}
         >
           <SafeAreaView style={styles.safeArea} edges={["bottom"]}>
-            {/* Scrolls so both login methods fit on small screens. */}
             <ScrollView
               style={styles.scroll}
               contentContainerStyle={[
@@ -237,56 +245,53 @@ export default function PhoneLoginScreen() {
                   },
                 ]}
               >
-                Enter your mobile{"\n"}number
+                Enter your email or{"\n"}mobile number
               </Text>
               <Text style={styles.subtitle}>
                 We'll send you a one-time password to verify.
               </Text>
 
-              <Text style={styles.sectionLabel}>LOGIN WITH PHONE</Text>
               <View style={styles.inputGroup}>
-                <Text style={styles.label}>Phone number</Text>
-
+                <Text style={styles.label}>Email or mobile number</Text>
                 <View
                   style={[
-                    styles.phoneInputContainer,
-                    phoneFocused && styles.phoneInputContainerFocused,
+                    styles.inputContainer,
+                    inputFocused && styles.inputContainerFocused,
+                    errorMessage ? styles.inputContainerError : null,
                   ]}
                 >
-                  <View style={styles.countryCodeContainer}>
-                    <Text style={styles.countryCode}>+91</Text>
-                  </View>
-
                   <TextInput
-                    ref={phoneInputRef}
-                    value={phoneNumber}
-                    onChangeText={handlePhoneNumberChange}
-                    placeholder="98765 43210"
+                    value={identifierInput}
+                    onChangeText={(value) => {
+                      setIdentifierInput(value);
+                      if (errorMessage) setErrorMessage(null);
+                    }}
+                    editable={!isSendingOtp}
+                    placeholder="Enter email or mobile number"
                     placeholderTextColor={colors.placeholder}
-                    keyboardType="number-pad"
-                    inputMode="numeric"
-                    maxLength={10}
+                    keyboardType="email-address"
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    autoComplete="username"
+                    textContentType="username"
                     style={styles.input}
-                    textContentType="telephoneNumber"
-                    autoComplete="tel"
-                    returnKeyType="done"
-                    onSubmitEditing={handleContinue}
-                    onFocus={() => setPhoneFocused(true)}
-                    onBlur={() => setPhoneFocused(false)}
-                    accessibilityLabel="Phone number"
+                    onFocus={() => setInputFocused(true)}
+                    onBlur={() => setInputFocused(false)}
+                    returnKeyType="send"
+                    onSubmitEditing={() => void handleSendOtp()}
+                    accessibilityLabel="Email or mobile number"
                   />
                 </View>
-
-                {showInvalidPhoneError ? (
-                  <Text style={styles.invalidPhoneError}>
-                    Invalid number. Please enter a valid Indian mobile number.
+                {errorMessage ? (
+                  <Text style={styles.errorText} accessibilityLiveRegion="polite">
+                    {errorMessage}
                   </Text>
                 ) : null}
               </View>
 
               <View style={styles.actions}>
                 <Pressable
-                  onPress={handleContinue}
+                  onPress={() => void handleSendOtp()}
                   disabled={!canSendOtp}
                   style={({ pressed }) => [
                     styles.button,
@@ -298,92 +303,21 @@ export default function PhoneLoginScreen() {
                     pressed && canSendOtp && styles.buttonPressed,
                   ]}
                   accessibilityRole="button"
-                  accessibilityState={{ disabled: !canSendOtp }}
+                  accessibilityState={{ disabled: !canSendOtp, busy: isSendingOtp }}
                 >
                   {canSendOtp ? <PrimaryCtaGradientFill key="enabled" /> : null}
-                  <Text style={[styles.buttonText, !canSendOtp && styles.buttonTextDisabled]}>
-                    {isSendingOtp ? "Sending OTP..." : "SEND PHONE OTP →"}
-                  </Text>
-                </Pressable>
-              </View>
-
-              <View style={styles.orRow} accessibilityElementsHidden importantForAccessibility="no-hide-descendants">
-                <View style={styles.orLine} />
-                <Text style={styles.orText}>OR</Text>
-                <View style={styles.orLine} />
-              </View>
-
-              <Text style={styles.sectionLabel}>LOGIN WITH EMAIL</Text>
-              <View style={styles.inputGroup}>
-                <Text style={styles.label}>Email address</Text>
-                <View
-                  style={[
-                    styles.emailInputContainer,
-                    emailFocused && styles.phoneInputContainerFocused,
-                    emailError ? styles.emailInputContainerError : null,
-                  ]}
-                >
-                  <TextInput
-                    value={email}
-                    onChangeText={(value) => {
-                      setEmail(value);
-                      if (emailError) setEmailError(null);
-                      if (emailNotRegistered) setEmailNotRegistered(false);
-                    }}
-                    placeholder="example@gmail.com"
-                    placeholderTextColor={colors.placeholder}
-                    keyboardType="email-address"
-                    inputMode="email"
-                    autoCapitalize="none"
-                    autoCorrect={false}
-                    autoComplete="email"
-                    textContentType="emailAddress"
-                    style={styles.emailInput}
-                    onFocus={() => setEmailFocused(true)}
-                    onBlur={() => setEmailFocused(false)}
-                    returnKeyType="send"
-                    onSubmitEditing={() => void handleSendEmailCode()}
-                    accessibilityLabel="Email address"
-                  />
-                </View>
-                {emailError ? (
-                  <Text style={styles.invalidPhoneError} accessibilityLiveRegion="polite">{emailError}</Text>
-                ) : (
-                  <Text style={styles.emailHint}>
-                    For accounts that already added and verified this email in Edit profile.
-                  </Text>
-                )}
-                {emailNotRegistered ? (
-                  <Pressable
-                    onPress={() => phoneInputRef.current?.focus()}
-                    style={({ pressed }) => [styles.linkButton, pressed && styles.buttonPressed]}
-                    accessibilityRole="button"
-                  >
-                    <Text style={styles.linkButtonText}>LOGIN WITH PHONE</Text>
-                  </Pressable>
-                ) : null}
-              </View>
-
-              <View style={styles.actions}>
-                <Pressable
-                  onPress={() => void handleSendEmailCode()}
-                  disabled={!canSendEmailCode}
-                  style={({ pressed }) => [
-                    styles.button,
-                    {
-                      backgroundColor: canSendEmailCode
-                        ? colors.ctaGradientStart
-                        : colors.ctaDisabled,
-                    },
-                    pressed && canSendEmailCode && styles.buttonPressed,
-                  ]}
-                  accessibilityRole="button"
-                  accessibilityState={{ disabled: !canSendEmailCode }}
-                >
-                  {canSendEmailCode ? <PrimaryCtaGradientFill key="email-enabled" /> : null}
-                  <Text style={[styles.buttonText, !canSendEmailCode && styles.buttonTextDisabled]}>
-                    {isSendingEmailCode ? "Sending OTP..." : "SEND EMAIL OTP →"}
-                  </Text>
+                  {isSendingOtp ? (
+                    <View style={styles.buttonContent}>
+                      <ActivityIndicator color={colors.ctaDisabledText} size="small" />
+                      <Text style={[styles.buttonText, styles.buttonTextDisabled]}>
+                        Sending OTP...
+                      </Text>
+                    </View>
+                  ) : (
+                    <Text style={[styles.buttonText, !canSendOtp && styles.buttonTextDisabled]}>
+                      SEND OTP →
+                    </Text>
+                  )}
                 </Pressable>
 
                 <Text style={styles.termsText}>
@@ -461,31 +395,21 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 18,
   },
-  phoneInputContainer: {
+  inputContainer: {
     height: 54,
-    flexDirection: "row",
-    alignItems: "center",
     borderWidth: 1,
     borderColor: colors.border,
     borderRadius: 12,
     backgroundColor: colors.inputBg,
     overflow: "hidden",
   },
-  phoneInputContainerFocused: {
+  inputContainerFocused: {
     borderColor: colors.primary,
   },
-  emailInputContainer: {
-    height: 54,
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: 12,
-    backgroundColor: colors.inputBg,
-    overflow: "hidden",
+  inputContainerError: {
+    borderColor: colors.error,
   },
-  emailInputContainerError: {
-    borderColor: "#F87171",
-  },
-  emailInput: {
+  input: {
     flex: 1,
     height: "100%",
     paddingHorizontal: 14,
@@ -497,82 +421,11 @@ const styles = StyleSheet.create({
       ? ({ outlineStyle: "none", outlineWidth: 0 } as object)
       : null),
   },
-  sectionLabel: {
-    color: colors.primary,
-    fontFamily: fonts.bold,
-    fontSize: 11,
-    lineHeight: 14,
-    letterSpacing: 1.4,
-    marginBottom: 8,
-  },
-  orRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 12,
-    marginVertical: 22,
-  },
-  orLine: {
-    flex: 1,
-    height: 1,
-    backgroundColor: colors.border,
-  },
-  orText: {
-    color: colors.muted,
-    fontFamily: fonts.bold,
-    fontSize: 12,
-    letterSpacing: 1.2,
-  },
-  linkButton: {
-    alignSelf: "flex-start",
-    paddingVertical: 6,
-  },
-  linkButtonText: {
-    color: colors.primary,
-    fontFamily: fonts.bold,
-    fontSize: 13,
-    letterSpacing: 0.6,
-  },
-  emailHint: {
-    color: colors.muted,
+  errorText: {
+    color: colors.error,
     fontFamily: fonts.medium,
     fontSize: 12,
     lineHeight: 16,
-  },
-  invalidPhoneError: {
-    color: "#F87171",
-    fontFamily: fonts.medium,
-    fontSize: 12,
-    lineHeight: 16,
-  },
-  countryCodeContainer: {
-    height: "100%",
-    minWidth: 72,
-    paddingHorizontal: 16,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: colors.countryCodeBg,
-    borderRightWidth: 1,
-    borderRightColor: colors.border,
-  },
-  countryCode: {
-    color: colors.primary,
-    fontFamily: fonts.bold,
-    fontSize: 15,
-    lineHeight: 20,
-  },
-  input: {
-    flex: 1,
-    height: "100%",
-    paddingHorizontal: 14,
-    color: colors.text,
-    fontFamily: fonts.bold,
-    fontSize: 18,
-    fontWeight: "600",
-    lineHeight: 22,
-    ...(Platform.OS === "web"
-      ? ({ outlineStyle: "none", outlineWidth: 0 } as object)
-      : null),
   },
   actions: {
     gap: 12,
@@ -591,6 +444,11 @@ const styles = StyleSheet.create({
   },
   buttonPressed: {
     opacity: 0.92,
+  },
+  buttonContent: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
   },
   buttonText: {
     color: colors.white,

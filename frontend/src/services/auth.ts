@@ -17,15 +17,73 @@ export function isAuthSessionMissing(error: unknown): boolean {
   return /auth session missing/i.test(message);
 }
 
+export type OtpSendFailure = "rate_limited" | "network" | "failed";
+
+/** Buckets a Supabase signInWithOtp error (or thrown error) for the login screen. */
+export function classifyOtpSendError(error: unknown): OtpSendFailure {
+  const record = (error ?? {}) as { message?: unknown; code?: unknown; status?: unknown; name?: unknown };
+  if (/signups? not allowed|signup_disabled|otp_disabled/i.test(`${record.code ?? ""} ${record.message ?? ""}`)) {
+    // New-user sign-up is switched off in the Supabase dashboard (Auth → Providers).
+    console.warn("[auth] OTP refused: sign-ups are disabled for this provider");
+  }
+  const message = String(record.message ?? error ?? "").toLowerCase();
+  const code = String(record.code ?? "").toLowerCase();
+  const status = Number(record.status);
+  if (
+    code.includes("rate_limit") ||
+    status === 429 ||
+    /security purposes|only request this after|after \d+ seconds|rate limit|too many requests/.test(message)
+  ) {
+    return "rate_limited";
+  }
+  if (
+    record.name === "AuthRetryableFetchError" ||
+    /network|failed to fetch|fetch failed|load failed|timed? ?out/.test(message)
+  ) {
+    return "network";
+  }
+  return "failed";
+}
+
+/**
+ * Readable message for a failed verifyOtp. Supabase reports wrong and expired
+ * codes with the same error, so the time since the code was sent decides.
+ */
+export function friendlyOtpVerifyError(
+  error: unknown,
+  sentAtMs: number,
+  expirySeconds: number,
+): string {
+  const record = (error ?? {}) as { message?: unknown; code?: unknown };
+  const message = String(record.message ?? error ?? "").toLowerCase();
+  const code = String(record.code ?? "").toLowerCase();
+  if (code === "otp_expired" || /expired|invalid|token/.test(message)) {
+    return Date.now() - sentAtMs > expirySeconds * 1000
+      ? "This OTP has expired. Please request a new OTP."
+      : "Incorrect OTP. Please check the code and try again.";
+  }
+  if (classifyOtpSendError(error) === "network") {
+    return "Network error. Please check your connection and try again.";
+  }
+  return "Unable to verify OTP. Please try again.";
+}
+
+/**
+ * Sends a phone OTP for login OR registration: Supabase signs in the existing
+ * user for a known number and creates the auth user only for a new number, so
+ * no duplicate account is ever made for the same phone.
+ */
 export async function sendOTP(phone: string) {
   const first = await supabase.auth.signInWithOtp({
     phone,
+    options: { shouldCreateUser: true },
   });
 
   if (first.error && isAuthSessionMissing(first.error)) {
     await supabase.auth.signOut({ scope: "local" }).catch(() => undefined);
     return await supabase.auth.signInWithOtp({
       phone,
+      options: { shouldCreateUser: true },
     });
   }
 

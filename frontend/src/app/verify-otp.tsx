@@ -11,11 +11,17 @@ import {
   useWindowDimensions,
   View,
 } from "react-native";
-import { isAuthSessionMissing, logout, sendOTP, verifyOTP } from "../services/auth";
+import {
+  friendlyOtpVerifyError,
+  isAuthSessionMissing,
+  logout,
+  sendOTP,
+  verifyOTP,
+} from "../services/auth";
 import {
   ACCOUNT_DELETED_MESSAGE,
+  ensureCurrentUserProfile,
   farmerExistsForPhone,
-  getCurrentUserProfile,
   isCurrentUserDeleted,
 } from "../services/profile";
 import { saveFarmerProfile } from "../services/local-profile";
@@ -69,6 +75,9 @@ const isOtpRateLimitError = (message: string) =>
     message,
   );
 
+/** Matches the "OTP expires in 5 minutes" note shown on this screen. */
+const SMS_OTP_EXPIRY_SECONDS = 5 * 60;
+
 export default function VerifyOtpScreen() {
   const router = useRouter();
   const { applyProfileUpdate } = useProfile();
@@ -77,10 +86,23 @@ export default function VerifyOtpScreen() {
   const waveProfile = "tall" as const;
   const waveContentInset = usePhoneLoginWaveInset(waveProfile);
   const waveClipHeight = usePhoneLoginWaveClipHeight(waveProfile);
-  const { phone } = useLocalSearchParams<{
-    phone: string;
+  // The unified login screen passes { identifier, authMethod: "phone" };
+  // `phone` is kept for older links into this screen.
+  const params = useLocalSearchParams<{
+    phone?: string;
+    identifier?: string;
+    authMethod?: "email" | "phone";
   }>();
+  const phone =
+    params.authMethod === "phone" && typeof params.identifier === "string"
+      ? params.identifier
+      : params.phone;
   const [otp, setOtp] = useState("");
+  // When the current code was sent; tells an expired code from a wrong one.
+  const otpSentAtRef = useRef(0);
+  useEffect(() => {
+    otpSentAtRef.current = Date.now();
+  }, []);
   const [resendSeconds, setResendSeconds] = useState(30);
   const [isVerifying, setIsVerifying] = useState(false);
   const [isResending, setIsResending] = useState(false);
@@ -164,12 +186,13 @@ export default function VerifyOtpScreen() {
           isAuthSessionMissing(error)
             ? "Unable to resend OTP. Please try again."
             : isOtpRateLimitError(error.message)
-              ? "Please wait a few seconds before requesting another OTP."
+              ? "Too many OTP requests. Please wait a moment and try again."
               : "Unable to resend OTP. Please try again.",
         );
         return;
       }
 
+      otpSentAtRef.current = Date.now();
       setOtp("");
       lastAutoVerifiedRef.current = "";
       setResendSeconds(30);
@@ -198,7 +221,7 @@ export default function VerifyOtpScreen() {
         alert(
           isAuthSessionMissing(error)
             ? "Unable to verify OTP. Please try again."
-            : error.message,
+            : friendlyOtpVerifyError(error, otpSentAtRef.current, SMS_OTP_EXPIRY_SECONDS),
         );
         return;
       }
@@ -248,8 +271,10 @@ export default function VerifyOtpScreen() {
         return;
       }
 
+      // Existing account → its profile; new account → a profile row is created
+      // (keyed by auth.uid()) and the empty name sends it to profile setup.
       const { profile: userProfile, error: userProfileError } =
-        await getCurrentUserProfile();
+        await ensureCurrentUserProfile();
 
       if (userProfileError) {
         if (!isAuthSessionMissing(userProfileError)) {
@@ -291,7 +316,8 @@ export default function VerifyOtpScreen() {
         return;
       }
 
-      router.replace("/farmer-profile" as never);
+      // New account: onboarding is the profile screen (name, state, district, language).
+      router.replace("/edit-profile" as never);
     } finally {
       setIsVerifying(false);
     }
@@ -333,7 +359,12 @@ export default function VerifyOtpScreen() {
               >
                 <View style={styles.headerRow}>
                   <Pressable
-                    onPress={() => router.back()}
+                    onPress={() => {
+                      // Login opens this screen with replace, so there is often
+                      // no history entry; go to login to change the number.
+                      if (router.canGoBack()) router.back();
+                      else router.replace("/phone-login" as never);
+                    }}
                     style={styles.backButton}
                     accessibilityRole="button"
                     accessibilityLabel="Go back"
@@ -367,7 +398,9 @@ export default function VerifyOtpScreen() {
                   >
                     Enter 6-digit OTP
                   </Text>
-                  <Text style={styles.sentTo}>Sent to {phoneDisplay}</Text>
+                  <Text style={styles.sentTo}>
+                    Enter the OTP sent to your mobile number {phoneDisplay}
+                  </Text>
 
                   <Pressable
                     onPress={focusOtpInput}

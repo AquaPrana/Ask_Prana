@@ -5,7 +5,6 @@ import { AUTH_SESSION_TIMEOUT_MS, waitForAuthReady, withTimeout } from "../lib/s
 import { completeEmailLinkSignIn, logout } from "../services/auth";
 import {
   ACCOUNT_DELETED_MESSAGE,
-  EMAIL_NOT_REGISTERED_MESSAGE,
   isCurrentUserDeleted,
 } from "../services/profile";
 import { Alert } from "react-native";
@@ -30,19 +29,6 @@ export default function StartupScreen() {
 
         const session = await waitForAuthReady();
         if (!mounted) return;
-
-        // Ask Prana accounts are created by phone OTP. A session without a phone
-        // (e.g. an email-only account) is not one: sign out, never use it.
-        if (session?.user && !session.user.phone) {
-          await logout();
-          if (mounted) {
-            router.replace({
-              pathname: "/phone-login",
-              params: { authError: EMAIL_NOT_REGISTERED_MESSAGE },
-            } as never);
-          }
-          return;
-        }
 
         if (session?.user) {
           const deleted = await withTimeout(

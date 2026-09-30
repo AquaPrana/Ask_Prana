@@ -145,6 +145,13 @@ export default function EditProfileScreen() {
     };
   }, [refreshEmailState]);
 
+  // New accounts arrive here straight from OTP verification (profile setup)
+  // with no screen behind them, so continue into Ask Prana instead.
+  const leaveScreen = () => {
+    if (router.canGoBack()) router.back();
+    else router.replace("/ask-prana" as never);
+  };
+
   const save = async () => {
     if (!name.trim()) {
       Alert.alert("Name required", "Please enter your full name.");
@@ -215,7 +222,7 @@ export default function EditProfileScreen() {
       }
 
       Alert.alert("Profile updated", "Your profile changes have been saved.");
-      router.back();
+      leaveScreen();
     } finally {
       setSaving(false);
     }
@@ -270,7 +277,7 @@ export default function EditProfileScreen() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.header}>
-        <Pressable onPress={() => router.back()} style={styles.backButton} accessibilityRole="button" accessibilityLabel="Go back">
+        <Pressable onPress={leaveScreen} style={styles.backButton} accessibilityRole="button" accessibilityLabel="Go back">
           <Feather name="arrow-left" size={20} color={colors.text} />
         </Pressable>
         <Text style={styles.title}>Edit profile</Text>

@@ -374,24 +374,8 @@ export function maskEmail(email: string) {
 }
 
 // ---------------------------------------------------------------------------
-// Email login for EXISTING accounts (second way into the same phone account)
+// Email login / registration (same unified OTP flow as phone)
 // ---------------------------------------------------------------------------
-
-export const EMAIL_NOT_REGISTERED_MESSAGE =
-  "Email account not found. Please sign in with your registered phone number first and add this email to your profile.";
-
-/** Supabase's "no user and signups not allowed" answer for shouldCreateUser: false. */
-function isEmailNotRegisteredError(error: unknown) {
-  const record = (error ?? {}) as { message?: unknown; code?: unknown };
-  const message = String(record.message ?? "").toLowerCase();
-  const code = String(record.code ?? "").toLowerCase();
-  return (
-    code === "otp_disabled" ||
-    code === "signup_disabled" ||
-    code === "user_not_found" ||
-    /signups? not allowed|user not found/.test(message)
-  );
-}
 
 /** Where a magic link returns on web; the existing client reads the session from it. */
 function loginRedirectUrl(): string | undefined {
@@ -402,55 +386,83 @@ function loginRedirectUrl(): string | undefined {
 }
 
 /**
- * Sends a login code (and, if the template has it, a magic link) ONLY to an
- * email already on an existing account: `shouldCreateUser: false` makes
- * Supabase refuse unknown emails instead of creating a new user. An email is
- * on an account only after it was verified from that account's Edit profile.
+ * Sends a login/registration code (and, if the template has it, a magic link).
+ * Supabase signs in the existing user for a known email (including an email
+ * linked to a phone account from Edit profile) and creates the auth user only
+ * for a new email, so the same address never gets a second account.
  */
 export async function sendEmailLoginCode(email: string): Promise<{
   error: string | null;
-  notRegistered: boolean;
+  /** Raw Supabase error, for callers that show their own messages. */
+  cause: unknown;
 }> {
   const { error } = await supabase.auth.signInWithOtp({
     email: normalizeEmail(email),
-    options: { shouldCreateUser: false, emailRedirectTo: loginRedirectUrl() },
+    options: { shouldCreateUser: true, emailRedirectTo: loginRedirectUrl() },
   });
-  if (!error) return { error: null, notRegistered: false };
-  if (isEmailNotRegisteredError(error)) {
-    return { error: EMAIL_NOT_REGISTERED_MESSAGE, notRegistered: true };
-  }
+  if (!error) return { error: null, cause: null };
   const friendly = friendlyEmailError(error);
   return {
     error:
       friendly === "Unable to send the verification code. Please try again."
         ? "Unable to send the login code. Please try again."
         : friendly,
-    notRegistered: false,
+    cause: error,
   };
 }
 
-/**
- * Verifies the emailed login code and returns the signed-in user id. Only
- * accounts created through phone OTP (they have a phone) are Ask Prana
- * accounts; any other email-only account is signed out again, never used.
- */
+/** Verifies the emailed login/registration code and returns the signed-in user id. */
 export async function verifyEmailLoginCode(email: string, code: string): Promise<{
   userId: string | null;
   error: string | null;
+  /** Raw Supabase error, for callers that show their own messages. */
+  cause: unknown;
 }> {
   const { data, error } = await supabase.auth.verifyOtp({
     email: normalizeEmail(email),
     token: code.trim(),
     type: "email",
   });
-  if (error) return { userId: null, error: friendlyEmailOtpError(error) };
+  if (error) return { userId: null, error: friendlyEmailOtpError(error), cause: error };
   const user = data.user ?? data.session?.user ?? null;
-  if (!user) return { userId: null, error: "Unable to sign in. Please try again." };
-  if (!user.phone) {
-    await supabase.auth.signOut({ scope: "local" }).catch(() => undefined);
-    return { userId: null, error: EMAIL_NOT_REGISTERED_MESSAGE };
+  if (!user) return { userId: null, error: "Unable to sign in. Please try again.", cause: null };
+  return { userId: user.id, error: null, cause: null };
+}
+
+/**
+ * Runs after every successful OTP sign-in. Makes sure the signed-in user has
+ * exactly one public.users row keyed by auth.uid() — a brand-new account gets
+ * a minimal row (phone from Auth, English) — and returns the profile. An
+ * existing row is never overwritten. An empty name means onboarding is needed.
+ */
+export async function ensureCurrentUserProfile(): Promise<{
+  profile: UserProfile | null;
+  error: Error | null;
+}> {
+  const session = await waitForAuthReady();
+  const user = session?.user;
+  if (!user) return { profile: null, error: new Error("You must be signed in.") };
+
+  const { data: existing, error: lookupError } = await supabase
+    .from("users")
+    .select("id")
+    .eq("id", user.id)
+    .maybeSingle();
+  if (lookupError) return { profile: null, error: new Error(lookupError.message) };
+
+  if (!existing) {
+    const { error: insertError } = await supabase.from("users").insert({
+      id: user.id,
+      phone: user.phone || null,
+      language: "English",
+    });
+    // 23505: another tab created the row first — that row is used as-is.
+    if (insertError && insertError.code !== "23505") {
+      return { profile: null, error: new Error(insertError.message) };
+    }
   }
-  return { userId: user.id, error: null };
+
+  return await getCurrentUserProfile();
 }
 
 export async function updateCurrentUserProfile(input: {
