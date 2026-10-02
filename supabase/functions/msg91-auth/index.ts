@@ -95,6 +95,12 @@ function phoneVariants(canonical: string): string[] {
   return Array.from(new Set([canonical, `+${digits}`, digits, local, `0${local}`]));
 }
 
+function samePhone(stored: string | null | undefined, canonical: string | null): boolean {
+  if (!canonical || !stored?.trim()) return false;
+  if (stored === canonical || phoneVariants(canonical).includes(stored)) return true;
+  return canonicalPhone(stored) === canonical;
+}
+
 function bytesToHex(bytes: ArrayBuffer): string {
   return Array.from(new Uint8Array(bytes), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
@@ -391,34 +397,39 @@ function avatarStoragePath(avatarUrl: string | null | undefined, userId: string)
 
 async function findUsers(admin: SupabaseClient, identity: VerifiedIdentity): Promise<UserRow[]> {
   const matches = new Map<string, UserRow>();
+  const add = (rows: UserRow[] | null) => {
+    for (const row of rows ?? []) matches.set(row.id, row);
+  };
   if (identity.phone) {
-    const { data, error } = await admin
-      .from("users")
-      .select(USER_SELECT)
-      .in("phone", phoneVariants(identity.phone));
+    const variants = phoneVariants(identity.phone);
+    const { data, error } = await admin.from("users").select(USER_SELECT).in("phone", variants);
     if (error) throw new Error(error.message);
-    for (const row of (data ?? []) as UserRow[]) matches.set(row.id, row);
+    add((data ?? []) as UserRow[]);
+    const local = variants.find((value) => /^[6-9]\d{9}$/.test(value));
+    if (local) {
+      const { data: loose, error: looseError } = await admin
+        .from("users")
+        .select(USER_SELECT)
+        .ilike("phone", `%${local}%`);
+      if (looseError) throw new Error(looseError.message);
+      add(((loose ?? []) as UserRow[]).filter((row) => samePhone(row.phone, identity.phone)));
+    }
   }
   if (identity.email) {
-    const { data, error } = await admin
-      .from("users")
-      .select(USER_SELECT)
-      .eq("email", identity.email);
+    const { data, error } = await admin.from("users").select(USER_SELECT).ilike("email", identity.email);
     if (error) throw new Error(error.message);
-    for (const row of (data ?? []) as UserRow[]) matches.set(row.id, row);
+    add(((data ?? []) as UserRow[]).filter((row) => canonicalEmail(row.email) === identity.email));
   }
   return [...matches.values()];
 }
 
-function chooseExisting(rows: UserRow[], identity: VerifiedIdentity): UserRow | null {
+/** One row for every stored form of the same phone or email. */
+function chooseExisting(rows: UserRow[], _identity: VerifiedIdentity): UserRow | null {
+  void _identity;
   const active = rows.filter((row) => !row.is_deleted);
   const pool = active.length ? active : rows;
   if (!pool.length) return null;
-  const canonical = pool.find((row) =>
-    (identity.phone && row.phone === identity.phone) ||
-    (identity.email && row.email === identity.email)
-  );
-  return canonical ?? pool.slice().sort((a, b) => a.id.localeCompare(b.id))[0];
+  return pool.slice().sort((a, b) => a.id.localeCompare(b.id))[0];
 }
 
 async function issueSession(admin: SupabaseClient, user: UserRow) {
@@ -571,7 +582,7 @@ Deno.serve(async (req) => {
       }
 
       const phoneChanged = canonicalPhone(user.phone) !== nextPhone && user.phone !== nextPhone;
-      const emailChanged = (user.email ?? null) !== nextEmail;
+      const emailChanged = canonicalEmail(user.email) !== nextEmail && (user.email ?? null) !== nextEmail;
       const phoneTaken = nextPhone && phoneChanged
         ? (await findUsers(admin, { phone: nextPhone, email: null })).some((row) => row.id !== user.id)
         : false;
@@ -683,11 +694,14 @@ Deno.serve(async (req) => {
         }
       }
 
-      const existing = await findUsers(admin, { phone, email });
-      const phoneTaken = Boolean(phone && existing.some((row) => phoneVariants(phone).includes(row.phone ?? "") || row.phone === phone));
-      const emailTaken = Boolean(email && existing.some((row) => (row.email ?? "").toLowerCase() === email));
-      if (phoneTaken || emailTaken) {
-        return response({ success: false, error: duplicateMessage(phoneTaken, emailTaken) }, 409);
+      const existing = (await findUsers(admin, { phone, email })).filter((row) => !row.is_deleted);
+      const phoneTaken = Boolean(phone && existing.some((row) => samePhone(row.phone, phone)));
+      const emailTaken = Boolean(email && existing.some((row) => canonicalEmail(row.email) === email));
+      if (existing.length) {
+        return response({
+          success: false,
+          error: duplicateMessage(phoneTaken || !emailTaken, emailTaken || !phoneTaken),
+        }, 409);
       }
 
       const { data, error } = await admin
