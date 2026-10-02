@@ -906,7 +906,7 @@ export default function AskPranaScreen() {
                 accessibilityRole="button"
                 accessibilityLabel={t("askPrana.openHistory")}
               >
-                <Feather name="menu" size={21} color={colors.primary} />
+                <Feather name="menu" size={21} color="#0F766E" />
               </Pressable>
             ) : (
               <View style={styles.headerSpacer} />
@@ -1144,8 +1144,33 @@ export default function AskPranaScreen() {
                   placeholderTextColor={colors.muted}
                   style={[
                     styles.textInput,
+                    !isDesktop && styles.textInputMobile,
                     {
-                      height: composerInputHeight,
+                      height: isDesktop
+                        ? composerInputHeight
+                        : composerInputHeight > COMPOSER_INPUT_MIN_HEIGHT
+                          ? composerInputHeight
+                          : Math.min(
+                              composerInputMaxHeight,
+                              Math.max(
+                                22,
+                                (draft || placeholder).split("\n").reduce(
+                                  (total, line) =>
+                                    total +
+                                    Math.max(
+                                      1,
+                                      Math.ceil(
+                                        line.length /
+                                          Math.max(
+                                            16,
+                                            Math.floor((composerInputWidth || 220) / 8),
+                                          ),
+                                      ),
+                                    ),
+                                  0,
+                                ) * 22,
+                              ),
+                            ),
                       maxHeight: composerInputMaxHeight,
                     },
                   ]}
@@ -1154,7 +1179,7 @@ export default function AskPranaScreen() {
                   onSelectionChange={handleCompactSelectionChange}
                   editable={!isRecording}
                   multiline
-                  textAlignVertical="top"
+                  textAlignVertical={isDesktop ? "top" : "center"}
                   blurOnSubmit={false}
                   returnKeyType="send"
                   submitBehavior="submit"
@@ -1823,7 +1848,7 @@ const styles = StyleSheet.create({
     paddingRight: 8,
     paddingVertical: 6,
     flexDirection: "row",
-    alignItems: "flex-end",
+    alignItems: "center",
     gap: 4,
   },
   inputShellDesktop: {
@@ -1850,6 +1875,12 @@ const styles = StyleSheet.create({
     outlineStyle: "none",
     outlineWidth: 0,
   },
+  textInputMobile: {
+    lineHeight: 22,
+    minHeight: 22,
+    paddingTop: 0,
+    paddingBottom: 0,
+  },
   micButton: {
     width: 34,
     height: 34,
@@ -1865,10 +1896,9 @@ const styles = StyleSheet.create({
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: colors.primary,
+    backgroundColor: "#0F766E",
     alignItems: "center",
     justifyContent: "center",
-    marginBottom: 1,
   },
   sendButton: {
     width: 32,
