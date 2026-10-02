@@ -39,11 +39,12 @@ function envValue(name: string): string {
   return (Deno.env.get(name) ?? "").trim().replace(/^["']+|["']+$/g, "");
 }
 
-function widgetCredentials(): { widgetId: string; tokenAuth: string } | null {
-  const widgetId = envValue("MSG91_WIDGET_ID");
-  const tokenAuth = envValue("MSG91_WIDGET_TOKEN");
-  if (!widgetId || !tokenAuth) return null;
-  return { widgetId, tokenAuth };
+function widgetId(): string {
+  return envValue("MSG91_WIDGET_ID");
+}
+
+function authkey(): string {
+  return envValue("MSG91_AUTHKEY");
 }
 
 function adminClient(): SupabaseClient | null {
@@ -276,53 +277,69 @@ function identityFromAccessToken(accessToken: string, body: unknown, widgetId: s
 }
 
 /** Confirms the widget JWT with MSG91. The widget token is not an authkey, so it is never sent as one. */
-async function verifyAccessToken(accessToken: string, credentials: { widgetId: string; tokenAuth: string }) {
-  const authkey = envValue("MSG91_AUTHKEY");
-  const attempts: Array<string | undefined> = authkey ? [authkey, undefined] : [undefined];
-  for (const key of attempts) {
-    const headers: Record<string, string> = {
+async function msg91Widget(path: string, payload: Record<string, unknown>): Promise<unknown> {
+  const key = authkey();
+  const id = widgetId();
+  if (!key || !id) {
+    return {
+      type: "error",
+      message: !key
+        ? "OTP service is not configured. The MSG91 authkey is missing."
+        : "OTP service is not configured. The MSG91 widget id is missing.",
+    };
+  }
+  const result = await fetch(`${WIDGET_API}${path}`, {
+    method: "POST",
+    headers: {
       Accept: "application/json",
       "Content-Type": "application/json",
-    };
-    if (key) headers.authkey = key;
-    const result = await fetch(`${WIDGET_API}/verifyAccessToken`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ "access-token": accessToken }),
-    });
-    const body = await result.json().catch(() => null);
-    if (!isMsg91Success(body)) {
-      console.warn("[msg91-auth] verifyAccessToken rejected", result.status, msg91Meta(body));
-      continue;
-    }
-    const identity = identityFromAccessToken(accessToken, body, credentials.widgetId);
-    if (identity) return identity;
-    console.warn("[msg91-auth] access token had no identifier", msg91Meta(body));
+      authkey: key,
+    },
+    body: JSON.stringify({ widgetId: id, ...payload }),
+  });
+  return await result.json().catch(() => null);
+}
+
+async function verifyAccessToken(accessToken: string) {
+  const body = await msg91Widget("/verifyAccessToken", { "access-token": accessToken });
+  if (!isMsg91Success(body)) {
+    console.warn("[msg91-auth] verifyAccessToken rejected", msg91Meta(body));
+    return null;
   }
+  const identity = identityFromAccessToken(accessToken, body, widgetId());
+  if (identity) return identity;
+  console.warn("[msg91-auth] access token had no identifier", msg91Meta(body));
   return null;
 }
 
-function otpFailure(body: unknown): { error: string; code?: "widget_unreachable" } {
-  const text = JSON.stringify(body ?? "").toLowerCase();
-  if (/ipblocked|ip blocked/.test(text)) {
-    return {
-      error: "MSG91 blocked this network. Open OTP, then Tokens, open your token, and clear any blocked IP on the IPs tab. Also turn off Captcha on the widget, then try again.",
-      code: "widget_unreachable",
-    };
+function msg91Message(body: unknown): string {
+  if (!body || typeof body !== "object") return "";
+  const message = (body as { message?: unknown }).message;
+  return typeof message === "string" ? message.trim() : "";
+}
+
+function otpFailure(body: unknown, fallback: string): { error: string; code?: string } {
+  const message = msg91Message(body);
+  const text = `${message} ${JSON.stringify(body ?? "")}`.toLowerCase();
+  if (/authkey is missing|widget id is missing/.test(text)) {
+    return { error: message, code: "missing_authkey" };
   }
-  if (/authenticationfailure|authentication failure|invalid auth|authkey/.test(text)) {
-    return {
-      error: "Verification could not be completed from this network. Please try again.",
-      code: "widget_unreachable",
-    };
+  if (/ipblocked|ip blocked/.test(text)) {
+    return { error: message || "MSG91 blocked this request (IPBlocked).", code: "ip_blocked" };
+  }
+  if (/authenticationfailure|authentication failure/.test(text)) {
+    return { error: message || "MSG91 rejected the OTP request (AuthenticationFailure).", code: "auth_rejected" };
   }
   if (/expired|already verified|already used/.test(text)) {
-    return { error: "This OTP has expired. Please request a new OTP." };
+    return { error: "This OTP has expired. Please request a new OTP.", code: "otp_expired" };
   }
   if (/wrong otp|otp invalid|invalid otp|not match|incorrect otp|does not match/.test(text)) {
-    return { error: "Incorrect OTP. Please check the code and try again." };
+    return { error: "Incorrect OTP. Please check the code and try again.", code: "otp_mismatch" };
   }
-  return { error: "Unable to verify OTP. Please try again." };
+  if (message && message.length < 180 && !/eyJ|authkey|tokenauth/i.test(message)) {
+    return { error: message };
+  }
+  return { error: fallback };
 }
 
 function requestIdFrom(body: unknown): string {
@@ -340,29 +357,23 @@ function requestIdFrom(body: unknown): string {
  * MSG91's response, not from the phone or email the app claims.
  */
 async function verifyOtpWithMsg91(
-  credentials: { widgetId: string; tokenAuth: string },
   reqId: string,
   otp: string,
 ): Promise<{ identity: VerifiedIdentity | null; error: string | null; code?: string }> {
-  const result = await fetch(`${WIDGET_API}/verifyOtp`, {
-    method: "POST",
-    headers: { Accept: "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify({ widgetId: credentials.widgetId, tokenAuth: credentials.tokenAuth, reqId, otp }),
-  });
-  const body = await result.json().catch(() => null);
+  const body = await msg91Widget("/verifyOtp", { reqId, otp });
   if (!isMsg91Success(body)) {
-    console.warn("[msg91-auth] verifyOtp rejected", result.status, msg91Meta(body));
-    const failure = otpFailure(body);
+    console.warn("[msg91-auth] verifyOtp rejected", msg91Meta(body));
+    const failure = otpFailure(body, "MSG91 could not verify the code.");
     return { identity: null, error: failure.error, code: failure.code ?? "otp_rejected" };
   }
   const jwt = findJwt(body);
   const payload = jwt ? decodeJwtPayload(jwt) : null;
-  if (payload && (!tokenStillValid(payload) || !widgetMatches(payload, credentials.widgetId))) {
+  if (payload && (!tokenStillValid(payload) || !widgetMatches(payload, widgetId()))) {
     return { identity: null, error: "Verification failed. Please request a new code." };
   }
   let identity = mergeIdentity(identityFromUnknown(body), identityFromUnknown(payload));
   if (jwt) {
-    const confirmed = await verifyAccessToken(jwt, credentials);
+    const confirmed = await verifyAccessToken(jwt);
     if (confirmed) identity = confirmed;
   }
   if (!identity.phone && !identity.email) {
@@ -518,10 +529,9 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
   if (req.method !== "POST") return response({ success: false, error: "Method not allowed." }, 405);
 
-  const credentials = widgetCredentials();
   const admin = adminClient();
-  if (!credentials || !admin || !serviceSecret()) {
-    console.error("[msg91-auth] widget credentials or service role key missing");
+  if (!admin || !serviceSecret()) {
+    console.error("[msg91-auth] service role key missing");
     return response({ success: false, error: "Authentication service is unavailable." }, 503);
   }
 
@@ -551,18 +561,19 @@ Deno.serve(async (req) => {
       const email = typeof input?.email === "string" ? canonicalEmail(input.email) : null;
       const identifier = phone ? phone.slice(1) : email;
       if (!identifier) return response({ success: false, error: "Please enter a valid email or mobile number." }, 400);
-      const sent = await fetch(`${WIDGET_API}/sendOtp`, {
-        method: "POST",
-        headers: { Accept: "application/json", "Content-Type": "application/json" },
-        body: JSON.stringify({ widgetId: credentials.widgetId, tokenAuth: credentials.tokenAuth, identifier }),
-      });
-      const body = await sent.json().catch(() => null);
+      const retryId = typeof input?.reqId === "string" ? input.reqId.trim() : "";
+      if (/^[A-Za-z0-9_-]{8,128}$/.test(retryId)) {
+        const retried = await msg91Widget("/retryOtp", { reqId: retryId });
+        if (isMsg91Success(retried)) return response({ success: true, reqId: retryId });
+      }
+      const body = await msg91Widget("/sendOtp", { identifier });
       if (!isMsg91Success(body)) {
-        const failure = otpFailure(body);
-        return response({ success: false, error: failure.error, code: failure.code }, failure.code === "widget_unreachable" ? 403 : 400);
+        const failure = otpFailure(body, "MSG91 could not send the code.");
+        const status = failure.code === "missing_authkey" ? 503 : failure.code === "ip_blocked" ? 403 : 400;
+        return response({ success: false, error: failure.error, code: failure.code }, status);
       }
       const reqId = requestIdFrom(body);
-      if (!reqId) return response({ success: false, error: "Unable to send OTP. Please try again." }, 502);
+      if (!reqId) return response({ success: false, error: "MSG91 did not return a request id." }, 502);
       return response({ success: true, reqId });
     }
     // Frontend flags are ignored. Existence is decided only after MSG91 verification.
@@ -765,17 +776,18 @@ Deno.serve(async (req) => {
     const accessToken = typeof input?.accessToken === "string" ? input.accessToken.trim() : "";
     let identity: VerifiedIdentity | null = null;
     if (/^[A-Za-z0-9_-]{8,128}$/.test(reqId) && /^\d{4,8}$/.test(otp)) {
-      const verified = await verifyOtpWithMsg91(credentials, reqId, otp);
+      const verified = await verifyOtpWithMsg91(reqId, otp);
       if (!verified.identity) {
+        const status = verified.code === "missing_authkey" ? 503 : verified.code === "ip_blocked" ? 403 : 401;
         return response({
           success: false,
-          error: verified.error ?? "Verification failed. Please request a new code.",
+          error: verified.error ?? "MSG91 could not verify the code.",
           code: verified.code ?? "otp_rejected",
-        }, verified.code === "widget_unreachable" ? 403 : 401);
+        }, status);
       }
       identity = verified.identity;
     } else if (accessToken.split(".").length === 3 && accessToken.length <= 8192) {
-      identity = await verifyAccessToken(accessToken, credentials);
+      identity = await verifyAccessToken(accessToken);
       if (!identity) return response({ success: false, error: "Verification failed. Please request a new code." }, 401);
     } else {
       return response({ success: false, error: "Please request a new OTP." }, 401);

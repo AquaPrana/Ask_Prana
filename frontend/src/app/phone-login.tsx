@@ -5,7 +5,7 @@ import {
   Geist_800ExtraBold,
   useFonts,
 } from "@expo-google-fonts/geist";
-import { classifyOtpSendError, sendOTP } from "../services/auth";
+import { sendOTP } from "../services/auth";
 import { isValidEmail, normalizeEmail, sendEmailLoginCode } from "../services/profile";
 import {
   AUTH_DARK_BACKGROUND,
@@ -66,9 +66,6 @@ const MESSAGES = {
   empty: "Please enter your email or mobile number.",
   invalid_email: "Please enter a valid email address.",
   invalid_phone: "Please enter a valid 10-digit mobile number.",
-  failed: "Unable to send OTP. Please try again.",
-  rate_limited: "Too many OTP requests. Please wait a moment and try again.",
-  network: "Network error. Please check your connection and try again.",
 } as const;
 
 type LoginIdentifier =
@@ -152,7 +149,7 @@ export default function PhoneLoginScreen() {
         // Existing email → login; new email → Supabase creates the account on verify.
         const result = await sendEmailLoginCode(parsed.identifier);
         if (result.error) {
-          setErrorMessage(MESSAGES[classifyOtpSendError(result.cause)]);
+          setErrorMessage(result.error);
           return;
         }
         router.push({
@@ -171,8 +168,7 @@ export default function PhoneLoginScreen() {
       // Existing number → login; new number → Supabase creates the account on verify.
       const { error } = await sendOTP(parsed.identifier);
       if (error) {
-        const bucket = classifyOtpSendError(error);
-        setErrorMessage(bucket === "failed" ? error.message : MESSAGES[bucket]);
+        setErrorMessage(error.message);
         return;
       }
       router.replace({
@@ -184,7 +180,7 @@ export default function PhoneLoginScreen() {
         },
       });
     } catch (error) {
-      setErrorMessage(MESSAGES[classifyOtpSendError(error)]);
+      setErrorMessage(error instanceof Error ? error.message : "MSG91 could not send the code.");
     } finally {
       isSendingOtpRef.current = false;
       setIsSendingOtp(false);

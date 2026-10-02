@@ -13,7 +13,7 @@ import {
   savePendingRegistration,
   type AppAccount,
 } from "./app-session";
-import { sendMsg91Otp, verifyMsg91Otp } from "./msg91";
+import { sendMsg91Otp } from "./msg91";
 
 export function isAuthSessionMissing(error: unknown): boolean {
   if (!error) return false;
@@ -155,7 +155,7 @@ export async function sendOTP(phone: string) {
   } catch (error) {
     return {
       data: null,
-      error: error instanceof Error ? error : new Error("Unable to send OTP. Please try again."),
+      error: error instanceof Error ? error : new Error("MSG91 could not send the code."),
     };
   }
 }
@@ -205,43 +205,19 @@ async function verifyFailure(error: unknown, data: VerifyPayload | null): Promis
 /**
  * The backend checks the code with MSG91 and decides whether this identifier
  * already has an account. A phone or email sent here is only a mismatch check.
- * It is not trusted. If MSG91 blocks the server, the browser checks the code
- * and the backend confirms MSG91's access token.
+ * It is not trusted.
  */
 export async function completeVerifiedLogin(
   proof: { reqId: string; otp: string },
   claimed: { phone?: string; email?: string },
 ): Promise<VerifyResult> {
-  const claim = { phone: claimed.phone, email: claimed.email };
-  let data: VerifyPayload | null = null;
-  let error: unknown = null;
-  try {
-    // Check the code on this device first. The server's network is a different
-    // IP, and a failed check there was marking a correct email code as wrong.
-    const verified = await verifyMsg91Otp(proof.reqId, proof.otp);
-    ({ data, error } = await invokeVerify({
-      action: "verify",
-      accessToken: verified.accessToken,
-      ...claim,
-    }));
-  } catch (browserError) {
-    const message = browserError instanceof Error ? browserError.message : "";
-    const blocked = /blocked this network|ipblocked|could not be completed from this network|authentication failure|invalid auth/i.test(message);
-    if (!blocked) {
-      return { isNewUser: false, user: null, error: { message: message || "Unable to verify OTP. Please try again." } };
-    }
-    ({ data, error } = await invokeVerify({
-      action: "verify",
-      reqId: proof.reqId,
-      otp: proof.otp,
-      ...claim,
-    }));
-    const serverMessage = typeof data?.error === "string" ? data.error : "";
-    const serverBlocked = data?.code === "widget_unreachable" || /blocked this network|ipblocked|could not be completed from this network|authentication failure/i.test(serverMessage);
-    if ((error || data?.success !== true) && serverBlocked) {
-      return { isNewUser: false, user: null, error: { message: /ipblocked|blocked this network/i.test(serverMessage) ? serverMessage : message } };
-    }
-  }
+  const { data, error } = await invokeVerify({
+    action: "verify",
+    reqId: proof.reqId,
+    otp: proof.otp,
+    phone: claimed.phone,
+    email: claimed.email,
+  });
   if (!data || error || data.success !== true) return await verifyFailure(error, data);
   if (data.isNewUser === true && typeof data.registrationToken === "string") {
     const identifier = data.verifiedIdentifier ?? {};
