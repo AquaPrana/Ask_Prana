@@ -19,7 +19,7 @@ import {
 import { PrimaryCtaGradientFill } from "../components/primary-cta-gradient";
 import { PRIMARY_CTA_START } from "../constants/primary-cta";
 import { useProfile } from "../context/profile-context";
-import { subscribeToAuthSession, waitForAuthReady } from "../lib/supabase";
+import { waitForAuthReady } from "../lib/supabase";
 import { friendlyOtpVerifyError, logout } from "../services/auth";
 import { saveFarmerProfile } from "../services/local-profile";
 import {
@@ -61,11 +61,9 @@ const EMAIL_OTP_EXPIRY_SECONDS = 3600;
 /**
  * Two uses of the same code screen:
  * - mode=link (default): verifies an email for the CURRENT signed-in phone
- *   user. The code comes from `updateUser({ email })` and is confirmed with
- *   `verifyOtp({ type: "email_change" })`, so the email joins that same user.
- * - mode=login: signed-out login with an email already verified on an
- *   account (`signInWithOtp`, shouldCreateUser: false → `verifyOtp` type
- *   "email"), which signs in to that same user id.
+ *   user with an MSG91 code, then attaches that address to the same account.
+ * - mode=login: signed-out login. MSG91 sends the code, and a matching
+ *   account is signed in (a new address gets one account after the code).
  *
  * Params: email (required); sent=1 when the code was already requested;
  * next=back to return to the previous screen (default: Ask Prana).
@@ -78,6 +76,7 @@ export default function VerifyEmailScreen() {
   const requestedEmail = normalizeEmail(typeof params.email === "string" ? params.email : "");
   const alreadySent = params.sent === "1" || loginMode;
   const returnBack = params.next === "back";
+  const codeLength = EMAIL_OTP_LENGTH;
   // After phone login this is where the app was about to go (e.g. /ask-prana).
   const nextPath =
     typeof params.next === "string" && params.next.startsWith("/") ? params.next : "/ask-prana";
@@ -182,44 +181,30 @@ export default function VerifyEmailScreen() {
       setError("Signed in, but your profile couldn't be loaded. Please try again.");
       return;
     }
-    if (!profile?.name) {
-      router.replace("/edit-profile" as never);
-      return;
+    if (profile?.name) {
+      await saveFarmerProfile({
+        name: profile.name,
+        state: profile.state ?? "",
+        district: profile.district ?? "",
+        language: profile.language ?? "",
+      });
+      await applyProfileUpdate({
+        name: profile.name,
+        state: profile.state ?? "",
+        district: profile.district ?? "",
+        language: profile.language ?? "",
+        phone: profile.phone ?? "",
+      });
     }
-    await saveFarmerProfile({
-      name: profile.name,
-      state: profile.state ?? "",
-      district: profile.district ?? "",
-      language: profile.language ?? "",
-    });
-    await applyProfileUpdate({
-      name: profile.name,
-      state: profile.state ?? "",
-      district: profile.district ?? "",
-      language: profile.language ?? "",
-      phone: profile.phone ?? "",
-    });
+    alert("Welcome back");
     router.replace("/ask-prana" as never);
   }, [applyProfileUpdate, router]);
-
-  // The email may hold a Sign in link instead of a code. Clicking it opens
-  // Ask Prana in another tab; the Supabase client shares that session with
-  // this tab, so continue here too.
-  useEffect(() => {
-    if (!loginMode) return;
-    const unsubscribe = subscribeToAuthSession((session) => {
-      if (session?.user) void finishEmailLogin();
-    });
-    return () => {
-      unsubscribe();
-    };
-  }, [finishEmailLogin, loginMode]);
 
   const verify = useCallback(async (value: string) => {
     const digits = value.replace(/\D/g, "");
     if (verifyLockRef.current || verified) return;
-    if (digits.length < 6) {
-      setError(`Enter the ${EMAIL_OTP_LENGTH}-digit code from your email.`);
+    if (digits.length < codeLength) {
+      setError(`Enter the ${codeLength}-digit code from your email.`);
       return;
     }
     verifyLockRef.current = true;
@@ -235,6 +220,12 @@ export default function VerifyEmailScreen() {
             ? friendlyOtpVerifyError(login.cause, codeSentAtRef.current, EMAIL_OTP_EXPIRY_SECONDS)
             : login.error,
         );
+        return;
+      }
+      if (login.isNewUser) {
+        verifyLockRef.current = false;
+        setVerifying(false);
+        router.replace({ pathname: "/edit-profile", params: { mode: "register" } } as never);
         return;
       }
       await finishEmailLogin();
@@ -256,16 +247,16 @@ export default function VerifyEmailScreen() {
       setCode("");
       lastAutoVerifiedRef.current = "";
       setResendSeconds(RESEND_SECONDS);
-      setNotice(`New email confirmed. Supabase also sent a code to your current email (${maskEmail(state.email)}). Enter that code to finish.`);
+      setNotice(`New email confirmed. Enter the code sent to ${maskEmail(state.email)} to finish.`);
       return;
     }
     setNotice(null);
     setVerified(true);
-  }, [finishEmailLogin, loginMode, targetEmail, verified]);
+  }, [codeLength, finishEmailLogin, loginMode, targetEmail, verified]);
 
   // Auto-verify once the full code is entered or pasted.
   useEffect(() => {
-    if (code.length < EMAIL_OTP_LENGTH) {
+    if (code.length < codeLength) {
       lastAutoVerifiedRef.current = "";
       return;
     }
@@ -273,7 +264,7 @@ export default function VerifyEmailScreen() {
       lastAutoVerifiedRef.current = code;
       void verify(code);
     }
-  }, [code, verify]);
+  }, [code, codeLength, verify]);
 
   const resend = async () => {
     if (resendSeconds > 0 || resending || requestLockRef.current) return;
@@ -295,7 +286,7 @@ export default function VerifyEmailScreen() {
     setResendSeconds(RESEND_SECONDS);
   };
 
-  const canVerify = code.length >= 6 && !verifying && !sending && !verified;
+  const canVerify = code.length >= codeLength && !verifying && !sending && !verified;
 
   return (
     <View style={styles.root}>
@@ -343,7 +334,7 @@ export default function VerifyEmailScreen() {
                   <TextInput
                     value={code}
                     onChangeText={(value) => {
-                      setCode(value.replace(/\D/g, "").slice(0, 10));
+                      setCode(value.replace(/\D/g, "").slice(0, codeLength));
                       if (error) setError(null);
                     }}
                     autoFocus
@@ -352,8 +343,8 @@ export default function VerifyEmailScreen() {
                     inputMode="numeric"
                     textContentType="oneTimeCode"
                     autoComplete="one-time-code"
-                    maxLength={10}
-                    placeholder={"•".repeat(EMAIL_OTP_LENGTH)}
+                    maxLength={codeLength}
+                    placeholder={"•".repeat(codeLength)}
                     placeholderTextColor={colors.mutedSoft}
                     style={[styles.codeInput, error ? styles.codeInputError : null]}
                     accessibilityLabel="Email verification code"
@@ -365,12 +356,6 @@ export default function VerifyEmailScreen() {
                     <Text style={styles.errorText} accessibilityLiveRegion="polite">{error}</Text>
                   ) : notice ? (
                     <Text style={styles.noticeText}>{notice}</Text>
-                  ) : loginMode ? (
-                    <Text style={styles.noticeText}>
-                      {Platform.OS === "web"
-                        ? "If the email has a \"Sign in\" link instead of a code, click it — you'll be signed in automatically."
-                        : "If the email has a \"Sign in\" link instead of a code, open it on this device or request a new code."}
-                    </Text>
                   ) : null}
 
                   <PrimaryButton

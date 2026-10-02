@@ -7,6 +7,7 @@ import {
 } from "@supabase/supabase-js";
 import Constants from "expo-constants";
 import { AppState, Platform } from "react-native";
+import { isAppSessionToken, loadAppSession } from "../services/app-session";
 
 type ExpoExtra = {
   supabaseUrl?: string | null;
@@ -290,6 +291,9 @@ function startAuthSubscription() {
       event === "SIGNED_OUT" ||
       event === "USER_UPDATED"
     ) {
+      // An Ask Prana session is not a Supabase Auth session. Supabase sign-out
+      // and token refresh must not wipe it or send the user back to login.
+      if (isAppSessionToken(currentSession?.access_token)) return;
       publishAuthState(session, event);
     }
   });
@@ -309,6 +313,12 @@ export function initializeAuthSession(): Promise<Session | null> {
         );
         publishAuthState(null, "RESTORED");
         return null;
+      }
+
+      const appSession = await loadAppSession();
+      if (appSession) {
+        publishAuthState(appSession, "RESTORED");
+        return appSession;
       }
 
       const { data, error } = await withTimeout(
@@ -344,6 +354,10 @@ export function acceptAuthenticatedSession(session: Session) {
   publishAuthState(session, "SIGNED_IN");
 }
 
+export function clearPublishedSession() {
+  publishAuthState(null, "SIGNED_OUT");
+}
+
 export function subscribeToAuthSession(listener: AuthStateListener) {
   authStateListeners.add(listener);
   void initializeAuthSession();
@@ -359,6 +373,12 @@ export function setInvalidSessionHandler(handler: (() => void) | null) {
 }
 
 async function clearInvalidSession() {
+  if (isAppSessionToken(currentSession?.access_token)) return;
+  const appSession = await loadAppSession();
+  if (appSession) {
+    publishAuthState(appSession, "SIGNED_IN");
+    return;
+  }
   try {
     await supabase.auth.signOut({ scope: "local" });
   } catch (error) {
@@ -374,10 +394,27 @@ async function clearInvalidSession() {
 
 /** Refreshes at most once even when several protected requests fail together. */
 export async function refreshValidSession(): Promise<Session | null> {
+  if (isAppSessionToken(currentSession?.access_token)) {
+    const expiresAt = Number(currentSession?.expires_at);
+    if (Number.isFinite(expiresAt) && expiresAt > Math.floor(Date.now() / 1000) + 60) {
+      return currentSession;
+    }
+    publishAuthState(null, "SIGNED_OUT");
+    return null;
+  }
   if (refreshPromise) return refreshPromise;
   refreshPromise = (async () => {
     const { data, error } = await supabase.auth.refreshSession();
     if (error || !data.session?.access_token) {
+      const appSession = await loadAppSession();
+      if (appSession) {
+        publishAuthState(appSession, "RESTORED");
+        return appSession;
+      }
+      // No Supabase session to refresh. Do not send the OTP screen back to login.
+      if (!currentSession?.access_token || isAppSessionToken(currentSession.access_token)) {
+        return null;
+      }
       console.warn("[auth] Session refresh failed:", error?.message ?? "No session");
       await clearInvalidSession();
       return null;
@@ -394,6 +431,12 @@ export async function ensureValidSession(): Promise<Session | null> {
   const restored = await initializeAuthSession();
   const session = currentSession ?? restored;
   if (!session?.access_token) return null;
+
+  if (isAppSessionToken(session.access_token)) {
+    const expiresAt = Number(session.expires_at);
+    if (Number.isFinite(expiresAt) && expiresAt <= Math.floor(Date.now() / 1000) + 60) return null;
+    return session;
+  }
 
   const payload = decodeJwtPayload(session.access_token);
   const issuedAt = Number(payload?.iat);
@@ -499,6 +542,15 @@ async function authSafeFetch(
   }
 
   const url = requestUrl(input);
+
+  // MSG91 verification and Ask Prana sessions are not Supabase JWTs. A 401
+  // from those calls must not refresh or clear the login.
+  if (
+    url.includes("/functions/v1/msg91-auth") ||
+    isAppSessionToken(currentSession?.access_token)
+  ) {
+    return firstResponse;
+  }
 
   if (url.includes("/auth/v1/") || !(await responseHasAuthError(firstResponse))) {
     return firstResponse;

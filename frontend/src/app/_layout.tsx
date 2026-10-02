@@ -60,6 +60,7 @@ export default function RootLayout() {
       pathname === "/" ||
       pathname === "/phone-login" ||
       pathname === "/verify-otp" ||
+      pathname === "/edit-profile" ||
       // Email-login code entry happens before there is a session.
       pathname === "/verify-email";
 

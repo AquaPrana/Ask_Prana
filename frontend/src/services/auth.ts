@@ -2,9 +2,18 @@ import { Platform } from "react-native";
 import type { EmailOtpType } from "@supabase/supabase-js";
 import {
   acceptAuthenticatedSession,
-  ensureValidSession,
+  clearPublishedSession,
   supabase,
 } from "../lib/supabase";
+import {
+  clearAppSession,
+  isAppSessionToken,
+  loadAppSession,
+  saveAppSession,
+  savePendingRegistration,
+  type AppAccount,
+} from "./app-session";
+import { sendMsg91Otp, verifyMsg91Otp } from "./msg91";
 
 export function isAuthSessionMissing(error: unknown): boolean {
   if (!error) return false;
@@ -29,6 +38,7 @@ export function classifyOtpSendError(error: unknown): OtpSendFailure {
   const message = String(record.message ?? error ?? "").toLowerCase();
   const code = String(record.code ?? "").toLowerCase();
   const status = Number(record.status);
+  if (/ipblocked|ip blocked|blocked this network/.test(message)) return "failed";
   if (
     code.includes("rate_limit") ||
     status === 429 ||
@@ -38,7 +48,7 @@ export function classifyOtpSendError(error: unknown): OtpSendFailure {
   }
   if (
     record.name === "AuthRetryableFetchError" ||
-    /network|failed to fetch|fetch failed|load failed|timed? ?out/.test(message)
+    /failed to fetch|fetch failed|load failed|timed? ?out|network request failed|network error/.test(message)
   ) {
     return "network";
   }
@@ -55,9 +65,16 @@ export function friendlyOtpVerifyError(
   expirySeconds: number,
 ): string {
   const record = (error ?? {}) as { message?: unknown; code?: unknown };
-  const message = String(record.message ?? error ?? "").toLowerCase();
+  const message = String(record.message ?? error ?? "");
+  if (/IP Security|request a new OTP|Unable to sign in|unavailable|Verification failed/i.test(message)) {
+    return message;
+  }
+  const lower = message.toLowerCase();
   const code = String(record.code ?? "").toLowerCase();
-  if (code === "otp_expired" || /expired|invalid|token/.test(message)) {
+  if (message && lower !== "invalid" && lower !== "expired" && !/expired|invalid|token/.test(lower)) {
+    return message;
+  }
+  if (code === "otp_expired" || /expired|invalid|token/.test(lower)) {
     return Date.now() - sentAtMs > expirySeconds * 1000
       ? "This OTP has expired. Please request a new OTP."
       : "Incorrect OTP. Please check the code and try again.";
@@ -69,43 +86,190 @@ export function friendlyOtpVerifyError(
 }
 
 /**
- * Sends a phone OTP for login OR registration: Supabase signs in the existing
- * user for a known number and creates the auth user only for a new number, so
- * no duplicate account is ever made for the same phone.
+ * MSG91 widget request for the phone currently being verified. Kept in memory
+ * so resend retries the same request instead of starting a second one.
  */
-export async function sendOTP(phone: string) {
-  const first = await supabase.auth.signInWithOtp({
-    phone,
-    options: { shouldCreateUser: true },
-  });
+const PENDING_OTP_KEY = "ask-prana-phone-otp";
+let pendingPhoneOtp: { phone: string; reqId: string } | null = null;
 
-  if (first.error && isAuthSessionMissing(first.error)) {
-    await supabase.auth.signOut({ scope: "local" }).catch(() => undefined);
-    return await supabase.auth.signInWithOtp({
-      phone,
-      options: { shouldCreateUser: true },
-    });
+function readPendingPhoneOtp(): { phone: string; reqId: string } | null {
+  if (typeof sessionStorage === "undefined") return pendingPhoneOtp;
+  try {
+    const raw = sessionStorage.getItem(PENDING_OTP_KEY);
+    if (!raw) return pendingPhoneOtp;
+    const parsed = JSON.parse(raw) as { phone?: unknown; reqId?: unknown };
+    if (typeof parsed.phone === "string" && typeof parsed.reqId === "string") {
+      pendingPhoneOtp = { phone: parsed.phone, reqId: parsed.reqId };
+    }
+  } catch {
+    // Ignore a corrupt saved request and send a new code.
   }
-
-  return first;
+  return pendingPhoneOtp;
 }
 
-export async function verifyOTP(
-  phone: string,
-  otp: string
-) {
-  const result = await supabase.auth.verifyOtp({
-    phone,
-    token: otp,
-    type: "sms",
-  });
-
-  if (!result.error && result.data.session) {
-    acceptAuthenticatedSession(result.data.session);
-    await ensureValidSession();
+function writePendingPhoneOtp(value: { phone: string; reqId: string } | null) {
+  pendingPhoneOtp = value;
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    if (value) sessionStorage.setItem(PENDING_OTP_KEY, JSON.stringify(value));
+    else sessionStorage.removeItem(PENDING_OTP_KEY);
+  } catch {
+    // Private mode can block storage; the in-memory request still works.
   }
+}
 
-  return result;
+export async function readFunctionError(error: unknown, fallback: string): Promise<string> {
+  if ((error as { name?: string } | null)?.name === "FunctionsFetchError") {
+    return "Network error. Please check your connection and try again.";
+  }
+  const context = (error as { context?: { json?: () => Promise<unknown> } } | null)?.context;
+  if (context && typeof context.json === "function") {
+    try {
+      const body = (await context.json()) as { error?: unknown };
+      if (typeof body?.error === "string" && body.error.trim()) return body.error.trim();
+    } catch {
+      // The response body can only be read once.
+    }
+  }
+  if (error instanceof Error && error.message && !/edge function|non-2xx/i.test(error.message)) {
+    return error.message;
+  }
+  return fallback;
+}
+
+/**
+ * Sends a phone OTP through MSG91. An existing number signs in and a new
+ * number gets an account only after the code is verified, so the same phone
+ * never creates a second account.
+ */
+export async function sendOTP(phone: string) {
+  try {
+    const pending = readPendingPhoneOtp();
+    const sent = await sendMsg91Otp(
+      phone,
+      Platform.OS === "web" ? "web" : "mobile",
+      pending?.phone === phone ? pending.reqId : undefined,
+    );
+    writePendingPhoneOtp({ phone, reqId: sent.reqId });
+    return { data: { reqId: sent.reqId }, error: null };
+  } catch (error) {
+    return {
+      data: null,
+      error: error instanceof Error ? error : new Error("Unable to send OTP. Please try again."),
+    };
+  }
+}
+
+type VerifyResult = {
+  isNewUser: boolean;
+  user: AppAccount | null;
+  error: { message: string } | null;
+};
+
+type VerifyPayload = {
+  success?: boolean;
+  error?: unknown;
+  code?: unknown;
+  isNewUser?: boolean;
+  registrationToken?: unknown;
+  verifiedIdentifier?: { phone?: unknown; email?: unknown };
+  user?: AppAccount;
+  session?: { token?: unknown; expiresAt?: unknown };
+};
+
+async function invokeVerify(body: Record<string, unknown>): Promise<{
+  data: VerifyPayload | null;
+  error: unknown;
+}> {
+  const { data, error } = await supabase.functions.invoke("msg91-auth", { body });
+  if (data && typeof data === "object") return { data: data as VerifyPayload, error };
+  const context = (error as { context?: { json?: () => Promise<unknown> } } | null)?.context;
+  if (context && typeof context.json === "function") {
+    try {
+      return { data: (await context.json()) as VerifyPayload, error };
+    } catch {
+      // The body was empty or already read.
+    }
+  }
+  return { data: null, error };
+}
+
+async function verifyFailure(error: unknown, data: VerifyPayload | null): Promise<VerifyResult> {
+  return {
+    isNewUser: false,
+    user: null,
+    error: { message: await readFunctionError(error, typeof data?.error === "string" ? data.error : "Unable to verify OTP. Please try again.") },
+  };
+}
+
+/**
+ * The backend checks the code with MSG91 and decides whether this identifier
+ * already has an account. A phone or email sent here is only a mismatch check.
+ * It is not trusted. If MSG91 blocks the server, the browser checks the code
+ * and the backend confirms MSG91's access token.
+ */
+export async function completeVerifiedLogin(
+  proof: { reqId: string; otp: string },
+  claimed: { phone?: string; email?: string },
+): Promise<VerifyResult> {
+  let { data, error } = await invokeVerify({
+    action: "verify",
+    reqId: proof.reqId,
+    otp: proof.otp,
+    phone: claimed.phone,
+    email: claimed.email,
+  });
+  const serverMessage = typeof data?.error === "string" ? data.error : "";
+  const widgetBlocked = data?.code === "widget_unreachable" || /blocked this network|ipblocked/i.test(serverMessage);
+  if ((error || data?.success !== true) && widgetBlocked) {
+    const verified = await verifyMsg91Otp(proof.reqId, proof.otp);
+    ({ data, error } = await invokeVerify({
+      action: "verify",
+      accessToken: verified.accessToken,
+      phone: claimed.phone,
+      email: claimed.email,
+    }));
+  }
+  if (error || data?.success !== true) return await verifyFailure(error, data);
+  if (data.isNewUser === true && typeof data.registrationToken === "string") {
+    const identifier = data.verifiedIdentifier ?? {};
+    await savePendingRegistration({
+      registrationToken: data.registrationToken,
+      phone: typeof identifier.phone === "string" ? identifier.phone : null,
+      email: typeof identifier.email === "string" ? identifier.email : null,
+    });
+    return { isNewUser: true, user: null, error: null };
+  }
+  const user = data.user as AppAccount | undefined;
+  const session = data.session as { token?: unknown; expiresAt?: unknown } | undefined;
+  if (!user?.id || typeof session?.token !== "string" || typeof session.expiresAt !== "string") {
+    return { isNewUser: false, user: null, error: { message: "Unable to sign in. Please try again." } };
+  }
+  const appSession = await saveAppSession({ token: session.token, expiresAt: session.expiresAt, user });
+  acceptAuthenticatedSession(appSession);
+  return { isNewUser: false, user, error: null };
+}
+
+export async function verifyOTP(phone: string, otp: string): Promise<{
+  data: { isNewUser: boolean; user: AppAccount | null } | null;
+  error: { message: string } | null;
+}> {
+  const pending = readPendingPhoneOtp();
+  const reqId = pending?.phone === phone ? pending.reqId : "";
+  if (!reqId) {
+    return { data: null, error: { message: "Please request a new OTP." } };
+  }
+  try {
+    const result = await completeVerifiedLogin({ reqId, otp: otp.trim() }, { phone });
+    if (result.error) return { data: null, error: result.error };
+    writePendingPhoneOtp(null);
+    return { data: { isNewUser: result.isNewUser, user: result.user }, error: null };
+  } catch (error) {
+    return {
+      data: null,
+      error: { message: error instanceof Error ? error.message : "Unable to verify OTP. Please try again." },
+    };
+  }
 }
 
 /**
@@ -195,6 +359,15 @@ export async function completeEmailLinkSignIn(): Promise<{
 }
 
 export async function logout(): Promise<{ error: Error | null }> {
+  const appSession = await loadAppSession();
+  if (appSession && isAppSessionToken(appSession.access_token)) {
+    await supabase.functions.invoke("msg91-auth", {
+      body: { action: "logout" },
+      headers: { Authorization: `Bearer ${appSession.access_token}` },
+    });
+    await clearAppSession();
+    clearPublishedSession();
+  }
   const { error } = await supabase.auth.signOut({ scope: "local" });
   if (error && !isAuthSessionMissing(error)) {
     // Safe diagnostics only — never log tokens or the session object.

@@ -3,7 +3,8 @@ import * as ImagePicker from "expo-image-picker";
 import { Alert, Image as RNImage, Linking, Platform } from "react-native";
 import { uploadImageToSupabaseStorage } from "./record-images";
 import { supabase } from "./supabase";
-import { updateCurrentUserAvatar } from "../services/profile";
+import { isAppSessionToken, loadAppSession } from "../services/app-session";
+import { updateAppSessionAvatar, updateCurrentUserAvatar } from "../services/profile";
 
 export const PROFILE_PHOTOS_BUCKET = "profile-photos";
 const PROFILE_PHOTO_MAX_EDGE = 1024;
@@ -37,35 +38,48 @@ export function avatarDisplayUrl(
   return `${base}${separator}v=${stamp}`;
 }
 
+function promptProfilePhotoActionWeb(hasExistingPhoto: boolean): Promise<ProfilePhotoAction> {
+  return new Promise((resolve) => {
+    const root = document.createElement("div");
+    root.setAttribute("role", "dialog");
+    root.style.cssText =
+      "position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.65);padding:24px;";
+    const panel = document.createElement("div");
+    panel.style.cssText =
+      "width:100%;max-width:320px;display:flex;flex-direction:column;gap:8px;padding:16px;border-radius:10px;background:#212121;border:1px solid #363636;";
+    const title = document.createElement("div");
+    title.textContent = "Profile photo";
+    title.style.cssText = "color:#F5F5F5;font:600 16px sans-serif;margin-bottom:4px;";
+    panel.appendChild(title);
+    const finish = (action: ProfilePhotoAction) => {
+      root.remove();
+      resolve(action);
+    };
+    const addButton = (label: string, action: ProfilePhotoAction, color: string) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.style.cssText = `min-height:40px;border-radius:8px;border:1px solid #363636;background:#171717;color:${color};font:600 14px sans-serif;cursor:pointer;`;
+      button.addEventListener("click", () => finish(action));
+      panel.appendChild(button);
+    };
+    addButton("Choose from Gallery", "gallery", "#F5F5F5");
+    if (hasExistingPhoto) addButton("Remove Photo", "remove", "#F87171");
+    addButton("Cancel", "cancel", "#A0A0A0");
+    root.addEventListener("click", (event) => {
+      if (event.target === root) finish("cancel");
+    });
+    root.appendChild(panel);
+    document.body.appendChild(root);
+  });
+}
+
 export function promptProfilePhotoAction(
   hasExistingPhoto: boolean,
 ): Promise<ProfilePhotoAction> {
   if (Platform.OS === "web") {
-    return new Promise((resolve) => {
-      const buttons: {
-        text: string;
-        style?: "cancel" | "destructive" | "default";
-        onPress?: () => void;
-      }[] = [
-        {
-          text: "Choose from Gallery",
-          onPress: () => resolve("gallery"),
-        },
-      ];
-      if (hasExistingPhoto) {
-        buttons.push({
-          text: "Remove Photo",
-          style: "destructive",
-          onPress: () => resolve("remove"),
-        });
-      }
-      buttons.push({
-        text: "Cancel",
-        style: "cancel",
-        onPress: () => resolve("cancel"),
-      });
-      Alert.alert("Profile photo", "Choose an option", buttons);
-    });
+    if (typeof document === "undefined") return Promise.resolve("cancel");
+    return promptProfilePhotoActionWeb(hasExistingPhoto);
   }
 
   return new Promise((resolve) => {
@@ -341,6 +355,29 @@ async function deleteStorageObject(
  * Keeps the previous avatar_url until both upload + DB update succeed.
  * Deletes the new object if the DB update fails.
  */
+async function readImageBase64(uri: string): Promise<{ base64: string | null; error: string | null }> {
+  try {
+    const response = await fetch(uri);
+    const blob = await response.blob();
+    if (blob.size > PROFILE_PHOTO_MAX_BYTES) {
+      return {
+        base64: null,
+        error: "This photo is larger than the 5 MB limit. Please choose a smaller image.",
+      };
+    }
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result ?? ""));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(blob);
+    });
+    const comma = dataUrl.indexOf(",");
+    return { base64: comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl, error: null };
+  } catch {
+    return { base64: null, error: "Unable to read the selected image." };
+  }
+}
+
 export async function uploadPreparedProfilePhoto(
   localUri: string,
   previousAvatarUrl?: string | null,
@@ -348,6 +385,27 @@ export async function uploadPreparedProfilePhoto(
   data: ProfilePhotoPickResult | null;
   error: string | null;
 }> {
+  const appSession = await loadAppSession();
+  if (isAppSessionToken(appSession?.access_token)) {
+    const image = await readImageBase64(localUri);
+    if (image.error || !image.base64) {
+      return { data: null, error: image.error ?? "Unable to read the selected image." };
+    }
+    const saved = await updateAppSessionAvatar({ imageBase64: image.base64 });
+    if (saved.error || !saved.avatarUrl || !saved.avatarUpdatedAt) {
+      return { data: null, error: saved.error?.message ?? "Unable to upload profile photo." };
+    }
+    return {
+      data: {
+        localUri,
+        remoteUrl: saved.avatarUrl,
+        updatedAt: saved.avatarUpdatedAt,
+        storagePath: storagePathFromAvatarUrl(saved.avatarUrl) ?? "",
+      },
+      error: null,
+    };
+  }
+
   const {
     data: { session },
   } = await supabase.auth.getSession();
@@ -443,6 +501,33 @@ export async function removeProfilePhoto(
   cleanupWarning: string | null;
   alreadyRemoved: boolean;
 }> {
+  const appSession = await loadAppSession();
+  if (isAppSessionToken(appSession?.access_token)) {
+    if (!previousAvatarUrl?.trim()) {
+      return {
+        error: null,
+        updatedAt: new Date().toISOString(),
+        cleanupWarning: null,
+        alreadyRemoved: true,
+      };
+    }
+    const saved = await updateAppSessionAvatar({ remove: true });
+    if (saved.error) {
+      return {
+        error: saved.error.message,
+        updatedAt: null,
+        cleanupWarning: null,
+        alreadyRemoved: false,
+      };
+    }
+    return {
+      error: null,
+      updatedAt: saved.avatarUpdatedAt,
+      cleanupWarning: null,
+      alreadyRemoved: false,
+    };
+  }
+
   const {
     data: { session },
   } = await supabase.auth.getSession();

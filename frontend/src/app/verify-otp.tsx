@@ -14,19 +14,11 @@ import {
 import {
   friendlyOtpVerifyError,
   isAuthSessionMissing,
-  logout,
   sendOTP,
   verifyOTP,
 } from "../services/auth";
-import {
-  ACCOUNT_DELETED_MESSAGE,
-  ensureCurrentUserProfile,
-  farmerExistsForPhone,
-  isCurrentUserDeleted,
-} from "../services/profile";
 import { saveFarmerProfile } from "../services/local-profile";
 import { useProfile } from "../context/profile-context";
-import { supabase } from "../lib/supabase";
 import { useRouter, useLocalSearchParams } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 import {
@@ -206,7 +198,7 @@ export default function VerifyOtpScreen() {
     setIsVerifying(true);
 
     try {
-      const { error } = await verifyOTP(phone as string, otp);
+      const { data, error } = await verifyOTP(phone as string, otp);
 
       if (error) {
         alert(
@@ -217,98 +209,29 @@ export default function VerifyOtpScreen() {
         return;
       }
 
-      if (await isCurrentUserDeleted()) {
-        alert(ACCOUNT_DELETED_MESSAGE);
-        await logout();
-        router.replace("/phone-login" as never);
+      if (data?.isNewUser) {
+        router.replace({ pathname: "/edit-profile", params: { mode: "register" } } as never);
         return;
       }
 
-      const {
-        exists: phoneExists,
-        profile: phoneProfile,
-        error: phoneLookupError,
-      } = await farmerExistsForPhone(phone as string);
-
-      if (phoneLookupError) {
-        if (!isAuthSessionMissing(phoneLookupError)) {
-          alert(phoneLookupError.message);
-        }
-        return;
-      }
-
-      if (phoneProfile?.isDeleted) {
-        alert(ACCOUNT_DELETED_MESSAGE);
-        await logout();
-        router.replace("/phone-login" as never);
-        return;
-      }
-
-      if (phoneExists && phoneProfile) {
+      const user = data?.user;
+      if (user?.name) {
         await saveFarmerProfile({
-          name: phoneProfile.name,
-          state: phoneProfile.state ?? "",
-          district: phoneProfile.district ?? "",
-          language: phoneProfile.language ?? "",
+          name: user.name,
+          state: user.state ?? "",
+          district: user.district ?? "",
+          language: user.language ?? "",
         });
         await applyProfileUpdate({
-          name: phoneProfile.name,
-          state: phoneProfile.state ?? "",
-          district: phoneProfile.district ?? "",
-          language: phoneProfile.language ?? "",
-          phone: phoneProfile.phone ?? "",
+          name: user.name,
+          state: user.state ?? "",
+          district: user.district ?? "",
+          language: user.language ?? "",
+          phone: user.phone ?? "",
         });
-        router.replace("/ask-prana" as never);
-        return;
       }
-
-      // Existing account → its profile; new account → a profile row is created
-      // (keyed by auth.uid()) and the empty name sends it to profile setup.
-      const { profile: userProfile, error: userProfileError } =
-        await ensureCurrentUserProfile();
-
-      if (userProfileError) {
-        if (!isAuthSessionMissing(userProfileError)) {
-          alert(userProfileError.message);
-        }
-        return;
-      }
-
-      if (userProfile?.isDeleted) {
-        alert(ACCOUNT_DELETED_MESSAGE);
-        await logout();
-        router.replace("/phone-login" as never);
-        return;
-      }
-
-      if (userProfile?.name) {
-        await saveFarmerProfile({
-          name: userProfile.name,
-          state: userProfile.state ?? "",
-          district: userProfile.district ?? "",
-          language: userProfile.language ?? "",
-        });
-        await applyProfileUpdate({
-          name: userProfile.name,
-          state: userProfile.state ?? "",
-          district: userProfile.district ?? "",
-          language: userProfile.language ?? "",
-          phone: userProfile.phone ?? "",
-        });
-        router.replace("/ask-prana" as never);
-        return;
-      }
-
-      const {
-        data: { session: stillSignedIn },
-      } = await supabase.auth.getSession();
-      if (!stillSignedIn?.user) {
-        router.replace("/phone-login" as never);
-        return;
-      }
-
-      // New account: onboarding is the profile screen (name, state, district, language).
-      router.replace("/edit-profile" as never);
+      alert("Welcome back");
+      router.replace("/ask-prana" as never);
     } finally {
       setIsVerifying(false);
     }

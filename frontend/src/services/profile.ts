@@ -1,9 +1,9 @@
-import { Platform } from "react-native";
-import * as Linking from "expo-linking";
 import type { User } from "@supabase/supabase-js";
-import { supabase, waitForAuthReady, withTimeout } from "../lib/supabase";
-import { isAuthSessionMissing } from "./auth";
+import { supabase, waitForAuthReady, withTimeout, acceptAuthenticatedSession } from "../lib/supabase";
+import { completeVerifiedLogin, isAuthSessionMissing, readFunctionError } from "./auth";
+import { loadAppSession, loadPendingRegistration, saveAppSession } from "./app-session";
 import { getFarmerProfile } from "./local-profile";
+import { sendMsg91EmailOtp } from "./msg91";
 
 export const ACCOUNT_DELETED_MESSAGE =
   "This account has been deleted.\nPlease contact support to restore your account.";
@@ -16,6 +16,7 @@ export type UserProfile = {
   district: string;
   language: string;
   phone?: string;
+  email?: string;
   avatarUrl?: string | null;
   avatarUpdatedAt?: string | null;
   isDeleted?: boolean;
@@ -31,6 +32,42 @@ export async function getCurrentUserProfile(): Promise<{
 
     if (!user) {
       return { profile: null, error: null };
+    }
+
+    if (session?.access_token.startsWith("ap_")) {
+      const { data, error } = await supabase.functions.invoke("msg91-auth", {
+        body: { action: "me" },
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      if (error || data?.success !== true || !data.user) {
+        return {
+          profile: null,
+          error: new Error(await readFunctionError(error, data?.error ?? "Unable to load profile right now.")),
+        };
+      }
+      const row = data.user as {
+        name?: string;
+        state?: string;
+        district?: string;
+        language?: string;
+        phone?: string | null;
+        email?: string | null;
+        avatar_url?: string | null;
+        avatar_updated_at?: string | null;
+      };
+      return {
+        profile: {
+          name: row.name || "",
+          state: row.state || "",
+          district: row.district || "",
+          language: row.language || "English",
+          phone: row.phone || "",
+          email: row.email || "",
+          avatarUrl: row.avatar_url ?? null,
+          avatarUpdatedAt: row.avatar_updated_at ?? null,
+        },
+        error: null,
+      };
     }
 
     const { data, error } = await withTimeout(
@@ -96,6 +133,10 @@ export async function isCurrentUserDeleted(): Promise<boolean> {
     const userId = session?.user?.id;
 
     if (!userId) {
+      return false;
+    }
+
+    if (session?.access_token.startsWith("ap_")) {
       return false;
     }
 
@@ -273,19 +314,6 @@ export function friendlyEmailError(error: unknown): string {
   return "Unable to send the verification code. Please try again.";
 }
 
-/**
- * Where the verification link returns. On web the existing Supabase client
- * (detectSessionInUrl) picks up the session from that URL; on native the
- * confirmation completes on Supabase and the screen re-reads the user on focus.
- * Must be listed under Auth → URL Configuration → Redirect URLs.
- */
-function emailRedirectUrl(): string | undefined {
-  if (Platform.OS === "web") {
-    return typeof window !== "undefined" ? `${window.location.origin}/edit-profile` : undefined;
-  }
-  return Linking.createURL("/edit-profile");
-}
-
 /** Latest email state from the Auth server (not a cached session). */
 export async function getCurrentUserEmailState(): Promise<{
   state: AuthEmailState | null;
@@ -298,72 +326,124 @@ export async function getCurrentUserEmailState(): Promise<{
   return { state: emailStateFromUser(data.user), error: null };
 }
 
+const EMAIL_CHANGE_STORAGE_KEY = "ask-prana-email-change-otp";
+let pendingEmailChange: { email: string; reqId: string } | null = null;
+
+function readPendingEmailChange(): { email: string; reqId: string } | null {
+  if (typeof sessionStorage === "undefined") return pendingEmailChange;
+  try {
+    const raw = sessionStorage.getItem(EMAIL_CHANGE_STORAGE_KEY);
+    if (!raw) return pendingEmailChange;
+    const parsed = JSON.parse(raw) as { email?: unknown; reqId?: unknown };
+    if (typeof parsed.email === "string" && typeof parsed.reqId === "string") {
+      pendingEmailChange = { email: parsed.email, reqId: parsed.reqId };
+    }
+  } catch {
+    // Ignore a corrupt saved request and send a new code.
+  }
+  return pendingEmailChange;
+}
+
+function writePendingEmailChange(value: { email: string; reqId: string } | null) {
+  pendingEmailChange = value;
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    if (value) sessionStorage.setItem(EMAIL_CHANGE_STORAGE_KEY, JSON.stringify(value));
+    else sessionStorage.removeItem(EMAIL_CHANGE_STORAGE_KEY);
+  } catch {
+    // Private mode can block storage; the in-memory request still works.
+  }
+}
+
 /**
- * Email lives on the Supabase Auth user (the users table has no email column),
- * so it is changed through Auth for the signed-in user only. Phone/OTP sign-in
- * is unaffected. With email confirmation on, Supabase sends a link and the
- * change stays pending (`new_email`) until it is confirmed.
+ * Sends an MSG91 code to the new address. The address is written onto the
+ * signed-in account only after that code is verified, so Supabase does not
+ * email a confirmation.
  */
 export async function requestCurrentUserEmailChange(email: string): Promise<{
   state: AuthEmailState | null;
   error: string | null;
 }> {
-  const { data, error } = await supabase.auth.updateUser(
-    { email: normalizeEmail(email) },
-    { emailRedirectTo: emailRedirectUrl() },
-  );
-  if (error) return { state: null, error: friendlyEmailError(error) };
-  return { state: data.user ? emailStateFromUser(data.user) : null, error: null };
+  const normalized = normalizeEmail(email);
+  const current = await getCurrentUserEmailState();
+  if (!current.state && current.error) return { state: null, error: current.error };
+  if (current.state?.status === "verified" && normalizeEmail(current.state.email) === normalized) {
+    return { state: current.state, error: null };
+  }
+  try {
+    const pending = readPendingEmailChange();
+    const sent = await sendMsg91EmailOtp(
+      normalized,
+      pending?.email === normalized ? pending.reqId : undefined,
+    );
+    writePendingEmailChange({ email: normalized, reqId: sent.reqId });
+    return {
+      state: {
+        email: current.state?.email ?? "",
+        pendingEmail: normalized,
+        status: "pending",
+      },
+      error: null,
+    };
+  } catch (error) {
+    return {
+      state: null,
+      error: error instanceof Error ? error.message : "Unable to send the verification code. Please try again.",
+    };
+  }
 }
 
-/** Re-sends the confirmation for a pending email change. */
+/** Re-sends the MSG91 code for a pending email change. */
 export async function resendEmailChangeVerification(pendingEmail: string): Promise<{
   error: string | null;
 }> {
-  const { error } = await supabase.auth.resend({
-    type: "email_change",
-    email: normalizeEmail(pendingEmail),
-    options: { emailRedirectTo: emailRedirectUrl() },
-  });
-  return { error: error ? friendlyEmailError(error) : null };
-}
-
-/**
- * Digits in the Supabase email OTP (Auth → Providers → Email → "Email OTP
- * length"). Keep in sync with the dashboard; codes of 6–10 digits are accepted.
- */
-export const EMAIL_OTP_LENGTH = 8;
-
-function friendlyEmailOtpError(error: unknown): string {
-  const record = (error ?? {}) as { message?: unknown; code?: unknown; status?: unknown };
-  const message = String(record.message ?? "").toLowerCase();
-  const code = String(record.code ?? "").toLowerCase();
-  // Supabase reports wrong and expired codes with the same error.
-  if (code === "otp_expired" || /token has expired or is invalid|invalid.*(otp|token)|otp.*invalid/.test(message)) {
-    console.warn("[profile] email OTP rejected:", code || "otp_invalid");
-    return "This code is invalid or has expired. Check the code, or request a new one.";
+  const normalized = normalizeEmail(pendingEmail);
+  try {
+    const pending = readPendingEmailChange();
+    const sent = await sendMsg91EmailOtp(
+      normalized,
+      pending?.email === normalized ? pending.reqId : undefined,
+    );
+    writePendingEmailChange({ email: normalized, reqId: sent.reqId });
+    return { error: null };
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : "Unable to send the verification code. Please try again.",
+    };
   }
-  return friendlyEmailError(error);
 }
 
+/** Digits in the MSG91 widget code used for email login and email changes. */
+export const EMAIL_OTP_LENGTH = 6;
+
 /**
- * Confirms an email change for the CURRENT signed-in user with the code
- * Supabase emailed after `updateUser({ email })`. The session stays the same
- * user, so no second account is created. With "Secure email change" on and an
- * existing email, both addresses must confirm; the state stays "pending" until then.
+ * Confirms an email change for the CURRENT signed-in user with the MSG91 code.
+ * The session stays the same user, so no second account is created.
  */
 export async function verifyEmailChangeCode(email: string, code: string): Promise<{
   state: AuthEmailState | null;
   error: string | null;
 }> {
-  const { error } = await supabase.auth.verifyOtp({
-    email: normalizeEmail(email),
-    token: code.trim(),
-    type: "email_change",
+  const normalized = normalizeEmail(email);
+  const pending = readPendingEmailChange();
+  const reqId = pending?.email === normalized ? pending.reqId : "";
+  if (!reqId) return { state: null, error: "Please request a new code." };
+
+  const { data, error } = await supabase.functions.invoke("msg91-auth", {
+    body: { action: "link-email", email: normalized, otp: code.trim(), reqId },
   });
-  if (error) return { state: null, error: friendlyEmailOtpError(error) };
-  const { state } = await getCurrentUserEmailState();
-  return { state, error: null };
+  if (error || data?.email_confirmed !== true) {
+    return {
+      state: null,
+      error: await readFunctionError(error, "Unable to verify the code. Please try again."),
+    };
+  }
+  writePendingEmailChange(null);
+  const refreshed = await getCurrentUserEmailState();
+  if (refreshed.state && normalizeEmail(refreshed.state.email) === normalized) {
+    return { state: refreshed.state, error: null };
+  }
+  return { state: { email: normalized, pendingEmail: "", status: "verified" }, error: null };
 }
 
 /** Masks an email for display, e.g. v****@gmail.com. */
@@ -374,104 +454,158 @@ export function maskEmail(email: string) {
 }
 
 // ---------------------------------------------------------------------------
-// Email login / registration (same unified OTP flow as phone)
+// Email login / registration (MSG91 code, same account rules as phone)
 // ---------------------------------------------------------------------------
 
-/** Where a magic link returns on web; the existing client reads the session from it. */
-function loginRedirectUrl(): string | undefined {
-  if (Platform.OS === "web") {
-    return typeof window !== "undefined" ? `${window.location.origin}/` : undefined;
+const EMAIL_OTP_STORAGE_KEY = "ask-prana-email-otp";
+let pendingEmailOtp: { email: string; reqId: string } | null = null;
+
+function readPendingEmailOtp(): { email: string; reqId: string } | null {
+  if (typeof sessionStorage === "undefined") return pendingEmailOtp;
+  try {
+    const raw = sessionStorage.getItem(EMAIL_OTP_STORAGE_KEY);
+    if (!raw) return pendingEmailOtp;
+    const parsed = JSON.parse(raw) as { email?: unknown; reqId?: unknown };
+    if (typeof parsed.email === "string" && typeof parsed.reqId === "string") {
+      pendingEmailOtp = { email: parsed.email, reqId: parsed.reqId };
+    }
+  } catch {
+    // Ignore a corrupt saved request and send a new code.
   }
-  return Linking.createURL("/");
+  return pendingEmailOtp;
+}
+
+function writePendingEmailOtp(value: { email: string; reqId: string } | null) {
+  pendingEmailOtp = value;
+  if (typeof sessionStorage === "undefined") return;
+  try {
+    if (value) sessionStorage.setItem(EMAIL_OTP_STORAGE_KEY, JSON.stringify(value));
+    else sessionStorage.removeItem(EMAIL_OTP_STORAGE_KEY);
+  } catch {
+    // Private mode can block storage; the in-memory request still works.
+  }
 }
 
 /**
- * Sends a login/registration code (and, if the template has it, a magic link).
- * Supabase signs in the existing user for a known email (including an email
- * linked to a phone account from Edit profile) and creates the auth user only
- * for a new email, so the same address never gets a second account.
+ * Sends a login/registration code through MSG91. Supabase does not email
+ * this code. An existing address signs in and a new address gets an account
+ * only after the code is verified.
  */
 export async function sendEmailLoginCode(email: string): Promise<{
   error: string | null;
-  /** Raw Supabase error, for callers that show their own messages. */
   cause: unknown;
 }> {
-  const { error } = await supabase.auth.signInWithOtp({
-    email: normalizeEmail(email),
-    options: { shouldCreateUser: true, emailRedirectTo: loginRedirectUrl() },
-  });
-  if (!error) return { error: null, cause: null };
-  const friendly = friendlyEmailError(error);
-  return {
-    error:
-      friendly === "Unable to send the verification code. Please try again."
-        ? "Unable to send the login code. Please try again."
-        : friendly,
-    cause: error,
-  };
+  const normalized = normalizeEmail(email);
+  try {
+    const pending = readPendingEmailOtp();
+    const sent = await sendMsg91EmailOtp(
+      normalized,
+      pending?.email === normalized ? pending.reqId : undefined,
+    );
+    writePendingEmailOtp({ email: normalized, reqId: sent.reqId });
+    return { error: null, cause: null };
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : "Unable to send the login code. Please try again.",
+      cause: error,
+    };
+  }
 }
 
-/** Verifies the emailed login/registration code and returns the signed-in user id. */
+/** Verifies the MSG91 email code. The server decides whether the account exists. */
 export async function verifyEmailLoginCode(email: string, code: string): Promise<{
   userId: string | null;
+  isNewUser: boolean;
   error: string | null;
-  /** Raw Supabase error, for callers that show their own messages. */
   cause: unknown;
 }> {
-  const { data, error } = await supabase.auth.verifyOtp({
-    email: normalizeEmail(email),
-    token: code.trim(),
-    type: "email",
-  });
-  if (error) return { userId: null, error: friendlyEmailOtpError(error), cause: error };
-  const user = data.user ?? data.session?.user ?? null;
-  if (!user) return { userId: null, error: "Unable to sign in. Please try again.", cause: null };
-  return { userId: user.id, error: null, cause: null };
+  const normalized = normalizeEmail(email);
+  const pending = readPendingEmailOtp();
+  const reqId = pending?.email === normalized ? pending.reqId : "";
+  if (!reqId) {
+    return { userId: null, isNewUser: false, error: "Please request a new code.", cause: null };
+  }
+
+  try {
+    const result = await completeVerifiedLogin({ reqId, otp: code.trim() }, { email: normalized });
+    if (result.error) {
+      return { userId: null, isNewUser: false, error: result.error.message, cause: result.error };
+    }
+    writePendingEmailOtp(null);
+    return { userId: result.user?.id ?? null, isNewUser: result.isNewUser, error: null, cause: null };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unable to verify the code. Please try again.";
+    return { userId: null, isNewUser: false, error: message, cause: error };
+  }
 }
 
 /**
- * Runs after every successful OTP sign-in. Makes sure the signed-in user has
- * exactly one public.users row keyed by auth.uid() — a brand-new account gets
- * a minimal row (phone from Auth, English) — and returns the profile. An
- * existing row is never overwritten. An empty name means onboarding is needed.
+ * Reads the signed-in profile. It never inserts a users row. A new account is
+ * created only by the registration request after MSG91 verification.
  */
 export async function ensureCurrentUserProfile(): Promise<{
   profile: UserProfile | null;
   error: Error | null;
 }> {
   const session = await waitForAuthReady();
-  const user = session?.user;
-  if (!user) return { profile: null, error: new Error("You must be signed in.") };
-
-  const { data: existing, error: lookupError } = await supabase
-    .from("users")
-    .select("id")
-    .eq("id", user.id)
-    .maybeSingle();
-  if (lookupError) return { profile: null, error: new Error(lookupError.message) };
-
-  if (!existing) {
-    const { error: insertError } = await supabase.from("users").insert({
-      id: user.id,
-      phone: user.phone || null,
-      language: "English",
-    });
-    // 23505: another tab created the row first — that row is used as-is.
-    if (insertError && insertError.code !== "23505") {
-      return { profile: null, error: new Error(insertError.message) };
-    }
-  }
-
+  if (!session?.user) return { profile: null, error: new Error("You must be signed in.") };
   return await getCurrentUserProfile();
+}
+
+export async function registerAskPranaAccount(input: {
+  name: string;
+  state: string;
+  district: string;
+  language: string;
+  phone?: string;
+  email?: string;
+}): Promise<{ error: string | null }> {
+  const pending = await loadPendingRegistration();
+  if (!pending) return { error: "Please verify your code again." };
+  const { data, error } = await supabase.functions.invoke("msg91-auth", {
+    body: {
+      action: "register",
+      registrationToken: pending.registrationToken,
+      name: input.name,
+      state: input.state,
+      district: input.district,
+      language: input.language,
+      phone: input.phone,
+      email: input.email,
+    },
+  });
+  if (error || data?.success !== true || !data.user?.id || !data.session?.token) {
+    return { error: await readFunctionError(error, data?.error ?? "Unable to create your account. Please try again.") };
+  }
+  const appSession = await saveAppSession({
+    token: data.session.token,
+    expiresAt: data.session.expiresAt,
+    user: data.user,
+  });
+  acceptAuthenticatedSession(appSession);
+  return { error: null };
 }
 
 export async function updateCurrentUserProfile(input: {
   name: string;
   phone?: string;
+  email?: string;
   state: string;
   district: string;
   language: string;
 }): Promise<{ error: Error | null }> {
+  const appSession = await loadAppSession();
+  if (appSession?.access_token.startsWith("ap_")) {
+    const { data, error } = await supabase.functions.invoke("msg91-auth", {
+      body: { action: "update-profile", ...input },
+      headers: { Authorization: `Bearer ${appSession.access_token}` },
+    });
+    if (error || data?.success !== true) {
+      return { error: new Error(await readFunctionError(error, data?.error ?? "Unable to save your profile. Please try again.")) };
+    }
+    return { error: null };
+  }
+
   const {
     data: { user },
     error: userError,
@@ -516,6 +650,41 @@ export async function updateCurrentUserProfile(input: {
   }
 
   return { error: null };
+}
+
+export async function updateAppSessionAvatar(input: {
+  imageBase64?: string;
+  remove?: boolean;
+}): Promise<{ avatarUrl: string | null; avatarUpdatedAt: string | null; error: Error | null }> {
+  const appSession = await loadAppSession();
+  if (!appSession?.access_token.startsWith("ap_")) {
+    return {
+      avatarUrl: null,
+      avatarUpdatedAt: null,
+      error: new Error("You must be signed in to update your profile photo."),
+    };
+  }
+  const { data, error } = await supabase.functions.invoke("msg91-auth", {
+    body: {
+      action: "update-avatar",
+      imageBase64: input.imageBase64,
+      remove: input.remove === true,
+    },
+    headers: { Authorization: `Bearer ${appSession.access_token}` },
+  });
+  if (error || data?.success !== true) {
+    return {
+      avatarUrl: null,
+      avatarUpdatedAt: null,
+      error: new Error(await readFunctionError(error, data?.error ?? "Unable to update profile photo.")),
+    };
+  }
+  const user = data.user as { avatar_url?: string | null; avatar_updated_at?: string | null } | undefined;
+  return {
+    avatarUrl: user?.avatar_url ?? null,
+    avatarUpdatedAt: user?.avatar_updated_at ?? null,
+    error: null,
+  };
 }
 
 export async function updateCurrentUserAvatar(input: {

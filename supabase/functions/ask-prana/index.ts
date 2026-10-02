@@ -1272,6 +1272,161 @@ type PreparedAttachment = {
   failure: "image" | "file" | "unsupported" | null;
 };
 
+async function handleConversations(
+  supabase: SupabaseClient,
+  userId: string,
+  body: Record<string, unknown>,
+) {
+  const claimedUserId = typeof body.userId === "string" ? body.userId : "";
+  if (claimedUserId && claimedUserId !== userId) {
+    return jsonResponse({ error: "Invalid session." }, 403);
+  }
+  const op = typeof body.op === "string" ? body.op : "";
+
+  if (op === "list") {
+    const { data: sessions, error } = await supabase
+      .from("chat_sessions")
+      .select("id, title, created_at, updated_at")
+      .eq("user_id", userId)
+      .order("updated_at", { ascending: false });
+    if (error) {
+      console.warn("[ask-prana] chat_sessions list failed", error.code ?? "");
+      return jsonResponse({ error: "Unable to load your conversation history. Please try again." }, 500);
+    }
+    const ids = (sessions ?? []).map((session) => session.id);
+    const previewBySession = new Map<string, { content: string; created_at: string }>();
+    if (ids.length) {
+      const { data: messages } = await supabase
+        .from("chat_messages")
+        .select("session_id, content, created_at")
+        .in("session_id", ids)
+        .order("created_at", { ascending: false });
+      for (const message of messages ?? []) {
+        if (!previewBySession.has(message.session_id)) {
+          previewBySession.set(message.session_id, {
+            content: message.content ?? "",
+            created_at: message.created_at,
+          });
+        }
+      }
+    }
+    return jsonResponse({
+      sessions: (sessions ?? [])
+        .filter((session) => previewBySession.has(session.id))
+        .map((session) => {
+          const preview = previewBySession.get(session.id);
+          const text = (preview?.content ?? "").replace(/\s+/g, " ").trim();
+          return {
+            id: session.id,
+            pondId: null,
+            title: session.title || "New conversation",
+            preview: text.length > 80 ? `${text.slice(0, 77)}...` : text,
+            createdAt: session.created_at,
+            lastActivity: preview?.created_at || session.updated_at,
+          };
+        }),
+    });
+  }
+
+  if (op === "latest") {
+    const { data, error } = await supabase
+      .from("chat_sessions")
+      .select("id")
+      .eq("user_id", userId)
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) return jsonResponse({ error: "Unable to open the conversation." }, 500);
+    return jsonResponse({ sessionId: data?.id ?? null });
+  }
+
+  if (op === "create") {
+    const requested = typeof body.title === "string" ? body.title.replace(/\s+/g, " ").trim() : "";
+    const title = requested ? requested.slice(0, 120) : "New conversation";
+    const { data, error } = await supabase
+      .from("chat_sessions")
+      .insert({ user_id: userId, title })
+      .select("id")
+      .single();
+    if (error || !data?.id) {
+      console.warn("[ask-prana] chat_sessions insert failed", error?.code ?? "");
+      return jsonResponse({ error: "Unable to start a conversation." }, 500);
+    }
+    return jsonResponse({ sessionId: data.id });
+  }
+
+  const sessionId = typeof body.sessionId === "string" ? body.sessionId : "";
+  if (!isValidUuid(sessionId)) return jsonResponse({ error: "Invalid session_id." }, 400);
+  const { data: owned } = await supabase
+    .from("chat_sessions")
+    .select("id, title, user_id")
+    .eq("id", sessionId)
+    .maybeSingle();
+  if (!owned || owned.user_id !== userId) {
+    return jsonResponse({ error: "Conversation not found." }, 404);
+  }
+
+  if (op === "scope") {
+    return jsonResponse({ pondId: null, userId });
+  }
+
+  if (op === "messages") {
+    const { data, error } = await supabase
+      .from("chat_messages")
+      .select("id, session_id, user_id, role, content, created_at")
+      .eq("session_id", sessionId)
+      .eq("user_id", userId)
+      .order("created_at", { ascending: true });
+    if (error) return jsonResponse({ error: "Unable to open the conversation." }, 500);
+    return jsonResponse({ messages: data ?? [] });
+  }
+
+  if (op === "save") {
+    const role = body.role === "assistant" ? "assistant" : "user";
+    const content = typeof body.content === "string" ? body.content : "";
+    const { data: message, error } = await supabase
+      .from("chat_messages")
+      .insert({ session_id: sessionId, user_id: userId, role, content })
+      .select("id, session_id, user_id, role, content, created_at")
+      .single();
+    if (error || !message) return jsonResponse({ error: "Unable to save message." }, 500);
+    const currentTitle = typeof owned.title === "string" ? owned.title.trim() : "";
+    const nextTitle = role === "user" && (!currentTitle || currentTitle === "New conversation")
+      ? content.replace(/\s+/g, " ").trim().slice(0, 60) || "New conversation"
+      : currentTitle || "New conversation";
+    await supabase
+      .from("chat_sessions")
+      .update({ title: nextTitle, updated_at: new Date().toISOString() })
+      .eq("id", sessionId)
+      .eq("user_id", userId);
+    return jsonResponse({ message });
+  }
+
+  if (op === "rename") {
+    const title = typeof body.title === "string" ? body.title.replace(/\s+/g, " ").trim() : "";
+    if (!title) return jsonResponse({ error: "Title cannot be empty." }, 400);
+    const { error } = await supabase
+      .from("chat_sessions")
+      .update({ title: title.slice(0, 120), updated_at: new Date().toISOString() })
+      .eq("id", sessionId)
+      .eq("user_id", userId);
+    if (error) return jsonResponse({ error: "Unable to rename the conversation." }, 500);
+    return jsonResponse({ success: true });
+  }
+
+  if (op === "delete") {
+    const { error } = await supabase
+      .from("chat_sessions")
+      .delete()
+      .eq("id", sessionId)
+      .eq("user_id", userId);
+    if (error) return jsonResponse({ error: "Unable to delete the conversation." }, 500);
+    return jsonResponse({ success: true });
+  }
+
+  return jsonResponse({ error: "Unknown conversation request." }, 400);
+}
+
 function jsonResponse(
   body: Record<string, unknown>,
   status = 200,
@@ -1691,23 +1846,40 @@ serve(async (req) => {
 
   const supabase = createClient(supabaseUrl, serviceKey);
 
-  // Validate the caller's JWT (APK must send a real user access token).
+  // Ask Prana sessions are opaque tokens. Older Supabase Auth JWTs still validate below.
   const accessToken = authorization.replace(/^Bearer\s+/i, "").trim();
-  const {
-    data: { user: authUser },
-    error: authError,
-  } = await supabase.auth.getUser(accessToken);
-
-  if (authError || !authUser) {
-    console.error("[ask-prana] JWT validation failed:", authError?.message);
-    return jsonResponse(
-      {
-        error: authError?.message
-          ? `Invalid JWT: ${authError.message}`
-          : "Invalid JWT or user not authenticated.",
-      },
-      401,
-    );
+  let authUser: { id: string } | null = null;
+  if (accessToken.startsWith("ap_")) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(accessToken));
+    const tokenHash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    const { data: appSession } = await supabase
+      .from("user_sessions")
+      .select("user_id, expires_at, revoked_at")
+      .eq("token_hash", tokenHash)
+      .maybeSingle();
+    const expiresAt = appSession?.expires_at ? new Date(String(appSession.expires_at)).getTime() : 0;
+    if (!appSession || appSession.revoked_at || expiresAt <= Date.now()) {
+      return jsonResponse({ error: "Invalid JWT or user not authenticated." }, 401);
+    }
+    authUser = { id: String(appSession.user_id) };
+    await supabase.from("user_sessions").update({ last_seen_at: new Date().toISOString() }).eq("token_hash", tokenHash);
+  } else {
+    const {
+      data: { user },
+      error: authError,
+    } = await supabase.auth.getUser(accessToken);
+    if (authError || !user) {
+      console.error("[ask-prana] JWT validation failed:", authError?.message);
+      return jsonResponse(
+        {
+          error: authError?.message
+            ? `Invalid JWT: ${authError.message}`
+            : "Invalid JWT or user not authenticated.",
+        },
+        401,
+      );
+    }
+    authUser = user;
   }
 
   console.log("[ask-prana] Authenticated user", authUser.id);
@@ -1753,6 +1925,10 @@ serve(async (req) => {
       languageLock,
       inputMode,
     } = body ?? {};
+
+    if (task === "conversations") {
+      return await handleConversations(supabase, authUser.id, body ?? {});
+    }
 
     const incomingAttachments = parseIncomingAttachments(attachments);
     const questionText =

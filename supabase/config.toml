@@ -256,7 +256,7 @@ otp_expiry = 3600
 
 [auth.sms]
 # Allow/disallow new user signups via SMS to your project.
-enable_signup = false
+enable_signup = true
 # If enabled, users need to confirm their phone number before signing in.
 enable_confirmations = false
 # Template for sending OTP to users
@@ -441,3 +441,22 @@ enabled = true
 verify_jwt = false
 entrypoint = "./functions/admin-ask-prana/index.ts"
 
+# Supabase Auth invokes these endpoints with signed Standard Webhooks payloads,
+# not a user JWT. Configure each hook and its signing secret in the Dashboard.
+[functions.auth-send-sms]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/auth-send-sms/index.ts"
+
+[functions.auth-send-email]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/auth-send-email/index.ts"
+
+# Phone OTP. Requires function secrets MSG91_WIDGET_ID and MSG91_WIDGET_TOKEN
+# (OTP widget id and token auth from the MSG91 dashboard). verify_jwt stays off
+# because the caller does not have a session yet.
+[functions.msg91-auth]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/msg91-auth/index.ts"

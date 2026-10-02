@@ -58,7 +58,10 @@ import {
 } from "../lib/ask-prana-language";
 import { speakAskPranaText, stopAskPranaSpeech } from "../lib/ask-prana-speech";
 import { type AskPranaRequestContext } from "../services/ask-prana";
-import { useAskPranaDisplayTranslation } from "../lib/ask-prana-display-translation";
+import {
+  selectAskPranaLanguageWhenReady,
+  useAskPranaDisplayTranslation,
+} from "../lib/ask-prana-display-translation";
 import { useProfile } from "../context/profile-context";
 
 const colors = {
@@ -659,13 +662,14 @@ export default function AskPranaScreen() {
     (code: AskPranaSpeechLanguageCode) => {
       const allowed =
         code === "en" || code === "te" || code === "hi" ? code : "en";
-      // Apply the local language state first. Static labels, placeholders and
-      // the picker must not wait for storage, profile, or chat translation IO.
-      setPreferredLanguage(allowed);
-      void setAppLanguage(allowed);
-      void saveAskPranaPreferredLanguage(allowed, { explicit: true });
+      // The click only selects a cache. Static labels and chat text swap
+      // together once every visible string is already translated.
+      selectAskPranaLanguageWhenReady(allowed, (language) => {
+        setPreferredLanguage(language);
+        void setAppLanguage(language);
+        void saveAskPranaPreferredLanguage(language, { explicit: true });
+      });
       setLanguagePickerOpen(false);
-
     },
     [],
   );

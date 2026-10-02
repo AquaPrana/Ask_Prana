@@ -5,7 +5,7 @@ import {
   Geist_800ExtraBold,
   useFonts,
 } from "@expo-google-fonts/geist";
-import { classifyOtpSendError, isAuthSessionMissing, sendOTP } from "../services/auth";
+import { classifyOtpSendError, sendOTP } from "../services/auth";
 import { isValidEmail, normalizeEmail, sendEmailLoginCode } from "../services/profile";
 import {
   AUTH_DARK_BACKGROUND,
@@ -171,11 +171,8 @@ export default function PhoneLoginScreen() {
       // Existing number → login; new number → Supabase creates the account on verify.
       const { error } = await sendOTP(parsed.identifier);
       if (error) {
-        setErrorMessage(
-          isAuthSessionMissing(error)
-            ? MESSAGES.failed
-            : MESSAGES[classifyOtpSendError(error)],
-        );
+        const bucket = classifyOtpSendError(error);
+        setErrorMessage(bucket === "failed" ? error.message : MESSAGES[bucket]);
         return;
       }
       router.replace({

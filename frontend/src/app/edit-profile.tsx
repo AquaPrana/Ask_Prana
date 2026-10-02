@@ -13,17 +13,26 @@ import {
   View,
 } from "react-native";
 import Feather from "@expo/vector-icons/Feather";
-import { useFocusEffect, useRouter } from "expo-router";
+import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import { useTranslation } from "react-i18next";
+import { UserAvatar } from "../components/user-avatar";
 import { useProfile } from "../context/profile-context";
+import {
+  pickProfilePhotoCandidate,
+  promptProfilePhotoAction,
+  removeProfilePhoto,
+  uploadPreparedProfilePhoto,
+} from "../lib/profile-photo";
 import { subscribeToAuthSession, supabase } from "../lib/supabase";
 import { logout } from "../services/auth";
+import { isAppSessionToken, loadAppSession, loadPendingRegistration } from "../services/app-session";
 import {
   type AuthEmailState,
   getCurrentUserEmailState,
   getCurrentUserProfile,
   isValidEmail,
   normalizeEmail,
+  registerAskPranaAccount,
   requestCurrentUserEmailChange,
   resendEmailChangeVerification,
   updateCurrentUserProfile,
@@ -49,17 +58,23 @@ const EMAIL_STATUS_BADGE: Record<AuthEmailState["status"], { text: string; color
 };
 
 const VERIFICATION_SENT_MESSAGE =
-  "Verification email sent to your new email address. Please open the email and confirm your new email address.";
+  "A verification code was sent to your new email address. Enter that code to confirm it.";
 
 export default function EditProfileScreen() {
   const router = useRouter();
+  const params = useLocalSearchParams<{ mode?: string }>();
+  const registerMode = params.mode === "register";
+  const [lockedPhone, setLockedPhone] = useState(false);
+  const [lockedEmail, setLockedEmail] = useState(false);
   const { t } = useTranslation();
-  const { applyProfileUpdate } = useProfile();
+  const { applyProfileUpdate, applyAvatarUpdate } = useProfile();
   const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const [logoutError, setLogoutError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [email, setEmail] = useState("");
   // Email as the Supabase Auth account currently holds it (confirmed + pending).
   const [emailState, setEmailState] = useState<AuthEmailState | null>(null);
@@ -73,6 +88,10 @@ export default function EditProfileScreen() {
   const [state, setState] = useState("");
   const [district, setDistrict] = useState("");
   const [language, setLanguage] = useState("English");
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
+  const [avatarUpdatedAt, setAvatarUpdatedAt] = useState<string | null>(null);
+  const [photoBusy, setPhotoBusy] = useState(false);
+  const [photoError, setPhotoError] = useState<string | null>(null);
 
   const applyEmailState = useCallback((next: AuthEmailState) => {
     setEmailState(next);
@@ -82,20 +101,45 @@ export default function EditProfileScreen() {
 
   /** Re-reads the Auth user from the server, e.g. after the verification link. */
   const refreshEmailState = useCallback(async () => {
+    const appSession = await loadAppSession();
+    if (isAppSessionToken(appSession?.access_token)) return;
     const { state: next } = await getCurrentUserEmailState();
     if (next) applyEmailState(next);
   }, [applyEmailState]);
 
   const loadProfile = useCallback(async () => {
     setLoading(true);
-    const {
-      data: { user },
-      error: userError,
-    } = await supabase.auth.getUser();
+    const appSession = await loadAppSession();
+    const hasAppSession = isAppSessionToken(appSession?.access_token);
 
-    if (userError || !user) {
-      router.replace("/phone-login" as never);
+    if (registerMode && !hasAppSession) {
+      const pending = await loadPendingRegistration();
+      if (!pending) {
+        router.replace("/phone-login" as never);
+        return;
+      }
+      setName("");
+      setPhone(pending.phone ?? "");
+      setEmail(pending.email ?? "");
+      setLockedPhone(Boolean(pending.phone));
+      setLockedEmail(Boolean(pending.email));
+      setState("");
+      setDistrict("");
+      setLanguage("English");
+      setLoading(false);
       return;
+    }
+
+    if (!hasAppSession) {
+      const {
+        data: { user },
+        error: userError,
+      } = await supabase.auth.getUser();
+
+      if (userError || !user) {
+        router.replace("/phone-login" as never);
+        return;
+      }
     }
 
     const { profile, error } = await getCurrentUserProfile();
@@ -107,15 +151,27 @@ export default function EditProfileScreen() {
 
     // Set once when the profile loads (never on every render), so typing is kept.
     emailDirtyRef.current = false;
-    const { state: authEmail } = await getCurrentUserEmailState();
-    if (authEmail) applyEmailState(authEmail);
+    if (hasAppSession) {
+      const accountEmail = profile?.email || appSession?.user.email || "";
+      setEmail(accountEmail);
+      setEmailState({
+        email: accountEmail,
+        pendingEmail: "",
+        status: accountEmail ? "verified" : "none",
+      });
+    } else {
+      const { state: authEmail } = await getCurrentUserEmailState();
+      if (authEmail) applyEmailState(authEmail);
+    }
     setName(profile?.name ?? "");
-    setPhone(profile?.phone ?? user.phone ?? "");
+    setPhone(profile?.phone ?? appSession?.user.phone ?? "");
     setState(profile?.state ?? "");
     setDistrict(profile?.district ?? "");
     setLanguage(profile?.language ?? "English");
+    setAvatarUrl(profile?.avatarUrl ?? null);
+    setAvatarUpdatedAt(profile?.avatarUpdatedAt ?? null);
     setLoading(false);
-  }, [applyEmailState, router]);
+  }, [applyEmailState, registerMode, router]);
 
   useEffect(() => {
     void loadProfile();
@@ -147,6 +203,46 @@ export default function EditProfileScreen() {
 
   // New accounts arrive here straight from OTP verification (profile setup)
   // with no screen behind them, so continue into Ask Prana instead.
+  const changePhoto = async () => {
+    if (registerMode || photoBusy) return;
+    const action = await promptProfilePhotoAction(Boolean(avatarUrl));
+    if (action === "cancel") return;
+    setPhotoError(null);
+    setPhotoBusy(true);
+    try {
+      if (action === "remove") {
+        const removed = await removeProfilePhoto(avatarUrl);
+        if (removed.error || !removed.updatedAt) {
+          setPhotoError(removed.error ?? "Unable to remove your profile photo.");
+          return;
+        }
+        setAvatarUrl(null);
+        setAvatarUpdatedAt(removed.updatedAt);
+        applyAvatarUpdate({ avatarUrl: null, avatarUpdatedAt: removed.updatedAt });
+        return;
+      }
+      const picked = await pickProfilePhotoCandidate(action);
+      if (picked.canceled) return;
+      if (picked.error || !picked.localUri) {
+        setPhotoError(picked.error ?? "Unable to select a profile photo.");
+        return;
+      }
+      const uploaded = await uploadPreparedProfilePhoto(picked.localUri, avatarUrl);
+      if (uploaded.error || !uploaded.data) {
+        setPhotoError(uploaded.error ?? "Unable to upload profile photo.");
+        return;
+      }
+      setAvatarUrl(uploaded.data.remoteUrl);
+      setAvatarUpdatedAt(uploaded.data.updatedAt);
+      applyAvatarUpdate({
+        avatarUrl: uploaded.data.remoteUrl,
+        avatarUpdatedAt: uploaded.data.updatedAt,
+      });
+    } finally {
+      setPhotoBusy(false);
+    }
+  };
+
   const leaveScreen = () => {
     if (router.canGoBack()) router.back();
     else router.replace("/ask-prana" as never);
@@ -154,7 +250,8 @@ export default function EditProfileScreen() {
 
   const save = async () => {
     if (!name.trim()) {
-      Alert.alert("Name required", "Please enter your full name.");
+      setSaveNotice(null);
+      setSaveError("Please enter your full name.");
       return;
     }
     // Validate on save only (typing is never blocked) and before any request.
@@ -170,36 +267,62 @@ export default function EditProfileScreen() {
       return;
     }
     setEmailError(null);
+    setSaveNotice(null);
+    setSaveError(null);
     setSaving(true);
     try {
+      if (registerMode) {
+        const created = await registerAskPranaAccount({
+          name: name.trim(),
+          phone: phone.trim(),
+          email: nextEmail,
+          state: state.trim(),
+          district: district.trim(),
+          language: language.trim() || "English",
+        });
+        if (created.error) {
+          Alert.alert("Unable to create account", created.error);
+          return;
+        }
+        router.replace("/ask-prana" as never);
+        return;
+      }
+      const appSession = await loadAppSession();
       const { error } = await updateCurrentUserProfile({
         name: name.trim(),
         phone: phone.trim(),
+        email: appSession ? nextEmail : undefined,
         state: state.trim(),
         district: district.trim(),
         language: language.trim() || "English",
       });
       if (error) {
-        Alert.alert("Unable to save profile", error.message);
+        setSaveError(error.message);
         return;
       }
       const { profile: savedProfile, error: reloadError } = await getCurrentUserProfile();
-      if (reloadError || !savedProfile) {
-        Alert.alert("Profile saved", "Your changes were saved, but the profile could not be refreshed yet.");
-        return;
+      if (!reloadError && savedProfile) {
+        await applyProfileUpdate({
+          name: savedProfile.name,
+          state: savedProfile.state,
+          district: savedProfile.district,
+          language: savedProfile.language,
+          phone: savedProfile.phone ?? "",
+          avatarUrl: savedProfile.avatarUrl ?? null,
+          avatarUpdatedAt: savedProfile.avatarUpdatedAt ?? null,
+        });
+        setName(savedProfile.name);
+        setPhone(savedProfile.phone ?? "");
+        setState(savedProfile.state);
+        setDistrict(savedProfile.district);
+        setLanguage(savedProfile.language || "English");
+        if (savedProfile.email) setEmail(savedProfile.email);
+        setAvatarUrl(savedProfile.avatarUrl ?? null);
+        setAvatarUpdatedAt(savedProfile.avatarUpdatedAt ?? null);
       }
-      await applyProfileUpdate({
-        name: savedProfile.name,
-        state: savedProfile.state,
-        district: savedProfile.district,
-        language: savedProfile.language,
-        phone: savedProfile.phone ?? "",
-        avatarUrl: savedProfile.avatarUrl ?? null,
-        avatarUpdatedAt: savedProfile.avatarUpdatedAt ?? null,
-      });
 
       // Unchanged email (ignoring case/whitespace) sends no Auth request.
-      if (emailChanged && nextEmail) {
+      if (!appSession && emailChanged && nextEmail) {
         // Email belongs to the Supabase Auth account, not the users table.
         const result = await requestCurrentUserEmailChange(nextEmail);
         if (result.error) {
@@ -211,18 +334,14 @@ export default function EditProfileScreen() {
         if (result.state) applyEmailState(result.state);
         if (!result.state || result.state.status === "pending") {
           // Not changed until the emailed code is verified for this same account.
-          setEmailNotice(
-            currentEmail
-              ? `${VERIFICATION_SENT_MESSAGE} If asked, also confirm from your current email (${currentEmail}).`
-              : VERIFICATION_SENT_MESSAGE,
-          );
+          setEmailNotice(VERIFICATION_SENT_MESSAGE);
           openEmailVerification(nextEmail);
           return;
         }
       }
 
-      Alert.alert("Profile updated", "Your profile changes have been saved.");
-      leaveScreen();
+      setSaveError(null);
+      setSaveNotice("Profile saved successfully.");
     } finally {
       setSaving(false);
     }
@@ -280,11 +399,26 @@ export default function EditProfileScreen() {
         <Pressable onPress={leaveScreen} style={styles.backButton} accessibilityRole="button" accessibilityLabel="Go back">
           <Feather name="arrow-left" size={20} color={colors.text} />
         </Pressable>
-        <Text style={styles.title}>Edit profile</Text>
+        <Text style={styles.title}>{registerMode ? "Create your Ask Prana account" : "Edit profile"}</Text>
         <View style={styles.backButton} />
       </View>
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-        <Text style={styles.caption}>Your account details</Text>
+        {registerMode ? null : (
+          <View style={styles.photoBlock}>
+            <UserAvatar
+              name={name}
+              avatarUrl={avatarUrl}
+              avatarUpdatedAt={avatarUpdatedAt}
+              size={88}
+              variant="solid"
+              showEditBadge
+              loading={photoBusy}
+              onPress={() => void changePhoto()}
+            />
+            {photoError ? <Text style={styles.photoError}>{photoError}</Text> : null}
+          </View>
+        )}
+        <Text style={styles.caption}>{registerMode ? "This code is verified. Add your details to finish." : "Your account details"}</Text>
         <Field label="Full name" value={name} onChangeText={setName} autoCapitalize="words" />
         <Field
           label="Email"
@@ -301,6 +435,7 @@ export default function EditProfileScreen() {
           autoCorrect={false}
           autoComplete="email"
           textContentType="emailAddress"
+          editable={!lockedEmail}
           placeholder="farmer@example.com"
           error={emailError}
           hint={
@@ -330,13 +465,15 @@ export default function EditProfileScreen() {
             <Text style={styles.resendLinkText}>Resend verification email</Text>
           </Pressable>
         ) : null}
-        <Field label="Phone number" value={phone} onChangeText={setPhone} keyboardType="phone-pad" />
+        <Field label="Phone number" value={phone} onChangeText={setPhone} keyboardType="phone-pad" editable={!lockedPhone} />
         <Field label="State" value={state} onChangeText={setState} autoCapitalize="words" />
         <Field label="District" value={district} onChangeText={setDistrict} autoCapitalize="words" />
         <Field label="Language" value={language} onChangeText={setLanguage} autoCapitalize="words" />
         <Pressable onPress={() => void save()} disabled={saving} style={[styles.saveButton, saving && styles.saveButtonDisabled]} accessibilityRole="button">
-          {saving ? <ActivityIndicator color={colors.text} /> : <Text style={styles.saveText}>Save changes</Text>}
+          {saving ? <ActivityIndicator color={colors.text} /> : <Text style={styles.saveText}>{registerMode ? "Create account" : "Save changes"}</Text>}
         </Pressable>
+        {saveNotice ? <Text style={styles.saveNotice} accessibilityLiveRegion="polite">{saveNotice}</Text> : null}
+        {saveError ? <Text style={styles.saveError} accessibilityLiveRegion="polite">{saveError}</Text> : null}
         <Pressable
           onPress={() => {
             setLogoutError(null);
@@ -383,6 +520,8 @@ const styles = StyleSheet.create({
   title: { color: colors.text, fontSize: 18, lineHeight: 23, fontWeight: "600" },
   content: { width: "100%", maxWidth: 520, alignSelf: "center", padding: 20, gap: 16 },
   caption: { color: colors.muted, fontSize: 14, lineHeight: 20, fontWeight: "400", marginBottom: 4 },
+  photoBlock: { alignItems: "center", gap: 8 },
+  photoError: { color: colors.danger, fontSize: 13, lineHeight: 18, fontWeight: "500", textAlign: "center" },
   field: { gap: 7 },
   label: { color: colors.text, fontSize: 14, lineHeight: 20, fontWeight: "500" },
   input: { minHeight: 46, color: colors.text, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, borderRadius: 8, paddingHorizontal: 12, fontSize: 15, lineHeight: 21, fontWeight: "400" },
@@ -398,6 +537,8 @@ const styles = StyleSheet.create({
   saveButton: { minHeight: 46, marginTop: 8, borderRadius: 8, alignItems: "center", justifyContent: "center", backgroundColor: colors.primary },
   saveButtonDisabled: { opacity: 0.6 },
   saveText: { color: colors.text, fontSize: 14, lineHeight: 20, fontWeight: "600" },
+  saveNotice: { color: colors.success, fontSize: 15, lineHeight: 21, fontWeight: "600", textAlign: "center" },
+  saveError: { color: colors.danger, fontSize: 14, lineHeight: 20, fontWeight: "600", textAlign: "center" },
   logoutButton: { minHeight: 46, flexDirection: "row", gap: 8, borderRadius: 8, alignItems: "center", justifyContent: "center", borderWidth: 1, borderColor: colors.border, backgroundColor: colors.card },
   logoutButtonHovered: { borderColor: colors.danger },
   logoutButtonPressed: { opacity: 0.7 },

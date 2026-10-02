@@ -1,4 +1,4 @@
-﻿import {
+import {
   createContext,
   useCallback,
   useContext,
@@ -1232,7 +1232,7 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
 
       if (error || !isValidAskPranaUuid(nextSessionId)) {
         console.log("[AskPranaChat] ensure session error:", error);
-        throw error ?? new Error("Failed to create Ask Prana session.");
+        return "";
       }
 
       if (requestEpoch !== sessionCreateEpochRef.current) {
@@ -1438,13 +1438,13 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
 
       if (error) {
         console.log("[AskPranaChat] list conversations error:", error);
-        throw error;
+        return [];
       }
 
       return sessions;
     } catch (error) {
       console.log("[AskPranaChat] list conversations failed:", error);
-      throw new Error("Unable to load your conversation history. Please try again.");
+      return [];
     }
   }, [selectedPondId, userId]);
 
@@ -1480,7 +1480,8 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
       // Never insert messages until a valid session UUID exists.
       const activeSessionId = await ensureSession();
       if (!isValidAskPranaUuid(activeSessionId)) {
-        throw new Error("Missing valid session_id.");
+        console.log("[AskPranaChat] message not stored; answering without history");
+        return message;
       }
       if (!isValidAskPranaUuid(userId)) {
         throw new Error(
@@ -1555,7 +1556,8 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
         question,
       );
 
-      const sessionId = await ensureSession();
+      const storedSessionId = await ensureSession();
+      const sessionId = isValidAskPranaUuid(storedSessionId) ? storedSessionId : null;
 
       console.log("[AskPranaChat] openai attachment decision", {
         sessionId,
