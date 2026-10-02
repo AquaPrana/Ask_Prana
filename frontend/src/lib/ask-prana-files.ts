@@ -1,9 +1,7 @@
-import { supabase } from "./supabase";
+import { ensureValidSession, supabase } from "./supabase";
 
-/** Live storage bucket (rename to ask-prana-files deferred until storage migration). */
-export const ASK_PRANA_FILES_BUCKET = "aquagpt-files";
-
-const FILE_BUCKETS = ["aquagpt-files", "ask-prana-files"] as const;
+/** Generated and attached chat files are stored in this public bucket. */
+export const ASK_PRANA_FILES_BUCKET = "ask-prana-files";
 
 export type AskPranaFileFolder = "audio" | "images" | "documents";
 
@@ -128,12 +126,36 @@ function guessExtension(
   return "bin";
 }
 
+async function fileToBase64(uri: string): Promise<string> {
+  const response = await fetch(uri);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function uploadErrorMessage(error: unknown, data: { error?: unknown } | null): Promise<string> {
+  if (typeof data?.error === "string" && data.error.trim()) return data.error.trim();
+  const context = (error as { context?: { json?: () => Promise<unknown> } } | null)?.context;
+  if (context && typeof context.json === "function") {
+    try {
+      const body = (await context.json()) as { error?: unknown };
+      if (typeof body?.error === "string" && body.error.trim()) return body.error.trim();
+    } catch {
+      // The response body can only be read once.
+    }
+  }
+  return "The upload did not return a stored file.";
+}
+
 export async function uploadAskPranaFile({
   uri,
   folder,
   fileName,
   mimeType,
-  userId,
 }: {
   uri: string;
   folder: AskPranaFileFolder;
@@ -145,42 +167,45 @@ export async function uploadAskPranaFile({
   const safeName = sanitizeFileName(
     fileName?.trim() || `file-${Date.now()}.${extension}`,
   );
-  const ownerPrefix = userId ? `${userId}/` : "";
-  const filePath = `${folder}/${ownerPrefix}${Date.now()}-${safeName}`;
+  if (folder !== "images" && folder !== "documents") {
+    return { data: null, error: "Choose an image or document to upload." };
+  }
 
   try {
-    const response = await fetch(uri);
-    const blob = await response.blob();
-    const resolvedMime = resolveMimeType(uri, safeName, mimeType, blob.type);
-
-    let lastError: string | null = null;
-    let uploaded = false;
-
-    for (const bucket of FILE_BUCKETS) {
-      const { error } = await supabase.storage.from(bucket).upload(filePath, blob, {
-        contentType: resolvedMime,
-        upsert: false,
-      });
-      if (!error) {
-        uploaded = true;
-        break;
-      }
-      lastError = error.message;
+    const session = await ensureValidSession();
+    const accessToken = session?.access_token ?? "";
+    if (!accessToken.startsWith("ap_")) {
+      return { data: null, error: "Your session has expired. Please log in again." };
     }
-
-    if (!uploaded) {
-      return { data: null, error: lastError ?? "Unable to upload file right now." };
-    }
-
-    const fileUrl = await getAskPranaFileUrl(filePath);
-
-    return {
-      data: {
-        filePath,
-        fileUrl: fileUrl ?? uri,
+    const fileBase64 = await fileToBase64(uri);
+    const resolvedMime = resolveMimeType(uri, safeName, mimeType, null);
+    const { data, error } = await supabase.functions.invoke("ask-prana", {
+      body: {
+        task: "upload-file",
+        folder,
         fileName: safeName,
         mimeType: resolvedMime,
-        fileSize: blob.size ?? null,
+        fileBase64,
+      },
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    const payload = data as {
+      success?: boolean;
+      filePath?: unknown;
+      fileUrl?: unknown;
+      fileName?: unknown;
+      mimeType?: unknown;
+      error?: unknown;
+    } | null;
+    if (error || payload?.success !== true || typeof payload.filePath !== "string") {
+      return { data: null, error: await uploadErrorMessage(error, payload) };
+    }
+    return {
+      data: {
+        filePath: payload.filePath,
+        fileUrl: typeof payload.fileUrl === "string" && payload.fileUrl ? payload.fileUrl : uri,
+        fileName: typeof payload.fileName === "string" && payload.fileName ? payload.fileName : safeName,
+        mimeType: typeof payload.mimeType === "string" && payload.mimeType ? payload.mimeType : resolvedMime,
         localUri: uri,
       },
       error: null,
@@ -188,10 +213,7 @@ export async function uploadAskPranaFile({
   } catch (error) {
     return {
       data: null,
-      error:
-        error instanceof Error
-          ? error.message
-          : "Unable to upload file right now.",
+      error: error instanceof Error ? error.message : "The selected file could not be read.",
     };
   }
 }
@@ -201,24 +223,10 @@ export async function getAskPranaFileUrl(filePath: string | null) {
     return null;
   }
 
-  for (const bucket of FILE_BUCKETS) {
-    const { data, error } = await supabase.storage
-      .from(bucket)
-      .createSignedUrl(filePath, 60 * 60 * 24 * 7);
-
-    if (!error && data?.signedUrl) {
-      return data.signedUrl;
-    }
+  const { data } = supabase.storage.from(ASK_PRANA_FILES_BUCKET).getPublicUrl(filePath);
+  const url = data.publicUrl ?? "";
+  if (!url || url.includes("/aquagpt-files/")) {
+    return null;
   }
-
-  for (const bucket of FILE_BUCKETS) {
-    const { data: publicData } = supabase.storage
-      .from(bucket)
-      .getPublicUrl(filePath);
-    if (publicData.publicUrl) {
-      return publicData.publicUrl;
-    }
-  }
-
-  return null;
+  return url;
 }

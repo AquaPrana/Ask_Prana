@@ -292,6 +292,7 @@ export default function AskPranaScreen() {
     draft,
     isSending,
     isUploading,
+    attachmentError,
     isRecording,
     isTranscribing,
     isLoadingMessages,
@@ -987,6 +988,10 @@ export default function AskPranaScreen() {
                   </Pressable>
                 ))}
               </ScrollView>
+            ) : null}
+
+            {attachmentError ? (
+              <Text style={styles.attachmentError}>{attachmentError}</Text>
             ) : null}
 
             {pendingAttachments.length > 0 || isUploading ? (
@@ -1707,6 +1712,14 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     paddingHorizontal: 10,
     gap: 6,
+  },
+  attachmentError: {
+    color: "#F0A0A0",
+    fontFamily: ASK_PRANA_FONT_FAMILY,
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: "400",
+    paddingHorizontal: 4,
   },
   pendingPreparingText: {
     color: colors.muted,

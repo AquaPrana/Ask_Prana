@@ -52,11 +52,9 @@ function getPublicFileUrl(filePath: string | null | undefined) {
     return null;
   }
 
-  for (const bucket of ["ask-prana-files", "aquagpt-files"] as const) {
-    const { data } = supabase.storage.from(bucket).getPublicUrl(filePath);
-    if (data.publicUrl) {
-      return data.publicUrl;
-    }
+  const { data } = supabase.storage.from("ask-prana-files").getPublicUrl(filePath);
+  if (data.publicUrl && !data.publicUrl.includes("/aquagpt-files/")) {
+    return data.publicUrl;
   }
 
   return null;

@@ -1212,7 +1212,9 @@ function AskPranaChatMessageBubbleComponent({
                   const refreshed = await getAskPranaFileUrl(
                     message.filePath ?? null,
                   );
-                  const target = refreshed ?? openUri;
+                  const stored =
+                    openUri && !openUri.includes("/aquagpt-files/") ? openUri : null;
+                  const target = refreshed ?? stored;
                   if (!target) {
                     Alert.alert(
                       t("askPrana.downloadUnavailable"),

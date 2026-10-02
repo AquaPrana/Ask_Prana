@@ -1803,6 +1803,81 @@ async function prepareAttachment(input: {
   return prepared;
 }
 
+function decodeBase64(value: string): Uint8Array | null {
+  try {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
+function imageKind(bytes: Uint8Array): string | null {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+  if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) return "image/webp";
+  if (bytes.length >= 6 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return "image/gif";
+  return null;
+}
+
+async function handleUploadFile(
+  supabase: SupabaseClient,
+  userId: string,
+  body: Record<string, unknown>,
+) {
+  const folder = body.folder === "images" || body.folder === "documents" ? body.folder : "";
+  if (!folder) return jsonResponse({ error: "Choose an image or document to upload." }, 400);
+  const raw = typeof body.fileBase64 === "string" ? body.fileBase64.trim() : "";
+  const payload = raw.replace(/^data:[^;]+;base64,/, "").replace(/\s/g, "");
+  const bytes = payload ? decodeBase64(payload) : null;
+  if (!bytes || bytes.length < 32) return jsonResponse({ error: "The selected file could not be read." }, 400);
+  const maxBytes = folder === "images" ? 4_000_000 : 6_000_000;
+  if (bytes.length > maxBytes) {
+    return jsonResponse({ error: "This file is too large. Please choose a smaller one." }, 400);
+  }
+  const detectedImage = imageKind(bytes);
+  if (folder === "images" && !detectedImage) {
+    return jsonResponse({ error: "Please choose a JPG, PNG, WEBP, or GIF image." }, 400);
+  }
+  const requestedName = typeof body.fileName === "string" ? body.fileName.trim() : "";
+  const safeName = (requestedName || `file-${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
+  const mimeType = folder === "images"
+    ? detectedImage!
+    : typeof body.mimeType === "string" && body.mimeType.trim()
+      ? body.mimeType.trim()
+      : "application/octet-stream";
+  const filePath = `${folder}/${userId}/${Date.now()}-${safeName}`;
+  const uploadBuckets = ["ask-prana-files", "aquagpt-files"] as const;
+  let storedBucket: (typeof uploadBuckets)[number] | null = null;
+  let storageError = "";
+  for (const bucket of uploadBuckets) {
+    const uploaded = await supabase.storage.from(bucket).upload(filePath, bytes, {
+      contentType: mimeType,
+      upsert: false,
+    });
+    if (!uploaded.error) {
+      storedBucket = bucket;
+      break;
+    }
+    storageError = uploaded.error.message || storageError;
+  }
+  if (!storedBucket) {
+    return jsonResponse({ error: storageError || "Storage rejected the upload." }, 500);
+  }
+  const signed = await supabase.storage.from(storedBucket).createSignedUrl(filePath, 60 * 60 * 24 * 7);
+  const fileUrl = signed.data?.signedUrl
+    ?? supabase.storage.from(storedBucket).getPublicUrl(filePath).data.publicUrl;
+  return jsonResponse({
+    success: true,
+    filePath,
+    fileUrl,
+    fileName: safeName,
+    mimeType,
+  });
+}
+
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", {
@@ -1928,6 +2003,10 @@ serve(async (req) => {
 
     if (task === "conversations") {
       return await handleConversations(supabase, authUser.id, body ?? {});
+    }
+
+    if (task === "upload-file") {
+      return await handleUploadFile(supabase, authUser.id, body ?? {});
     }
 
     const incomingAttachments = parseIncomingAttachments(attachments);
@@ -2607,33 +2686,18 @@ If this is a normal water/feed question with no prior health context, do not men
         const filePath =
           `documents/${trustedUserId}/generated/${sessionPart}/${Date.now()}-${safeName}`;
 
-        let uploadedBucket: string | null = null;
-        let lastUploadError: string | null = null;
-        for (const bucket of STORAGE_BUCKETS) {
-          const { error: uploadError } = await supabase.storage
-            .from(bucket)
-            .upload(filePath, bytes, {
-              contentType: mimeType,
-              upsert: false,
-            });
-          if (!uploadError) {
-            uploadedBucket = bucket;
-            break;
-          }
-          lastUploadError = uploadError.message;
-          console.error("[ask-prana] generated file upload failed", {
-            bucket,
-            message: uploadError.message,
+        const uploadedBucket = "ask-prana-files";
+        const { error: uploadError } = await supabase.storage
+          .from(uploadedBucket)
+          .upload(filePath, bytes, {
+            contentType: mimeType,
+            upsert: false,
           });
-        }
 
-        if (!uploadedBucket) {
-          console.error("[ask-prana] document generation storage failed:", lastUploadError);
+        if (uploadError) {
+          console.error("[ask-prana] document generation storage failed:", uploadError.message);
           return jsonResponse(
-            {
-              error:
-                "Could not store the generated document. Please try again in a moment.",
-            },
+            { error: uploadError.message || "Storage rejected the upload." },
             500,
           );
         }
@@ -2642,14 +2706,13 @@ If this is a normal water/feed question with no prior health context, do not men
           .from(uploadedBucket)
           // `download` makes browsers save it under the readable file name.
           .createSignedUrl(filePath, 60 * 60 * 24 * 7, { download: fileName });
+        const fileUrl = signed?.signedUrl
+          ?? supabase.storage.from(uploadedBucket).getPublicUrl(filePath).data.publicUrl;
 
-        if (signedError || !signed?.signedUrl) {
+        if (!fileUrl || fileUrl.includes("/aquagpt-files/")) {
           console.error("[ask-prana] signed URL failed:", signedError?.message);
           return jsonResponse(
-            {
-              error:
-                "Document was generated but the download link could not be created. Please try again.",
-            },
+            { error: signedError?.message || "Storage rejected the upload." },
             500,
           );
         }
@@ -2669,7 +2732,7 @@ If this is a normal water/feed question with no prior health context, do not men
             fileName,
             mimeType,
             path: filePath,
-            url: signed.signedUrl,
+            url: fileUrl,
             byteSize: bytes.byteLength,
             format,
           },
