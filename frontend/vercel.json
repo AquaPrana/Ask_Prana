@@ -1,0 +1,10 @@
+{
+  "routes": [
+    { "handle": "filesystem" },
+    {
+      "src": "^/(ask-prana|phone-login|edit-profile|verify-otp|verify-email)/?$",
+      "dest": "/$1.html"
+    },
+    { "src": "/(.*)", "dest": "/index.html" }
+  ]
+}

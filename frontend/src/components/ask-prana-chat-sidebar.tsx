@@ -9,6 +9,7 @@ import {
   Text,
   TextInput,
   View,
+  type ViewStyle,
 } from "react-native";
 import Feather from "@expo/vector-icons/Feather";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -34,6 +35,17 @@ const colors = {
 };
 
 const PINNED_CHATS_STORAGE_KEY = "ask-prana:pinned-chat-ids";
+
+const drawerRootWeb: ViewStyle | null =
+  Platform.OS === "web"
+    ? ({
+        position: "fixed",
+        top: 0,
+        right: 0,
+        bottom: 0,
+        left: 0,
+      } as ViewStyle)
+    : null;
 
 function dateGroup(value: string, t: (key: string) => string) {
   const date = new Date(value);
@@ -565,7 +577,10 @@ export function AskPranaChatSidebar({
       </ScrollView>
 
       <Pressable
-        onPress={() => router.push("/edit-profile" as never)}
+        onPress={() => {
+          if (!isDesktop) onClose();
+          router.push("/edit-profile" as never);
+        }}
         style={({ pressed }) => [styles.profileRow, pressed && styles.pressed]}
         accessibilityRole="button"
         accessibilityLabel={t("profile.title")}
@@ -597,7 +612,7 @@ export function AskPranaChatSidebar({
           animationType="fade"
           onRequestClose={onClose}
         >
-          <View style={styles.drawerRoot}>
+          <View style={[styles.drawerRoot, drawerRootWeb]}>
             <Pressable style={styles.backdrop} onPress={onClose} />
             <View style={styles.mobileDrawer}>{content}</View>
           </View>
@@ -781,9 +796,17 @@ const styles = StyleSheet.create({
   profileName: { color: colors.text, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 14, lineHeight: 19, fontWeight: "600" },
   profileSubtitle: { color: colors.muted, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 12, lineHeight: 16, fontWeight: "400" },
   pressed: { opacity: 0.78 },
-  drawerRoot: { flex: 1, flexDirection: "row" },
-  backdrop: { ...StyleSheet.absoluteFill, backgroundColor: "rgba(0,0,0,0.58)" },
-  mobileDrawer: { width: "86%", maxWidth: 340, height: "100%" },
+  drawerRoot: { flex: 1, width: "100%", height: "100%", flexDirection: "row" },
+  backdrop: {
+    position: "absolute",
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    backgroundColor: "rgba(0,0,0,0.58)",
+    zIndex: 0,
+  },
+  mobileDrawer: { width: "86%", maxWidth: 340, height: "100%", zIndex: 1 },
   dialogBackdrop: {
     flex: 1,
     justifyContent: "center",

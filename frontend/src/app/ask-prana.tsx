@@ -249,6 +249,7 @@ export default function AskPranaScreen() {
   const [teluguScript, setTeluguScript] =
     useState<TeluguScriptPreference>("native");
   const [attachmentMenuOpen, setAttachmentMenuOpen] = useState(false);
+  const attachWrapRef = useRef<View>(null);
   const [attachmentPreview, setAttachmentPreview] = useState<{
     uri: string;
     fileName: string;
@@ -467,6 +468,33 @@ export default function AskPranaScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [messages, displayMessageText, displayMessageCache],
   );
+  useEffect(() => {
+    if (!attachmentMenuOpen || Platform.OS !== "web") return;
+    if (typeof document === "undefined") return;
+    const onPointerDown = (event: Event) => {
+      const target = event.target;
+      const host =
+        attachWrapRef.current as unknown as { contains?: (node: Node) => boolean } | null;
+      const byId =
+        typeof document.getElementById === "function"
+          ? document.getElementById("ask-prana-attach-wrap")
+          : null;
+      const insideHost =
+        host &&
+        typeof host.contains === "function" &&
+        target instanceof Node &&
+        host.contains(target);
+      const insideById =
+        byId && target instanceof Node && byId.contains(target);
+      if (insideHost || insideById) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setAttachmentMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    return () => document.removeEventListener("pointerdown", onPointerDown, true);
+  }, [attachmentMenuOpen]);
+
   const sidebarVisible = sidebarOpen;
   const canSend =
     thinkingVisible ||
@@ -1065,7 +1093,49 @@ export default function AskPranaScreen() {
             ) : null}
 
             <View style={styles.inputRow}>
-              <View style={styles.inputShell}>
+              <View style={[styles.inputShell, isDesktop && styles.inputShellDesktop]}>
+                <View
+                  ref={attachWrapRef}
+                  nativeID="ask-prana-attach-wrap"
+                  style={styles.attachWrap}
+                >
+                  <Pressable
+                    onPress={() => setAttachmentMenuOpen((open) => !open)}
+                    disabled={composerBusy}
+                    style={({ pressed }) => [
+                      styles.attachButton,
+                      pressed && styles.pressed,
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel={t("askPrana.attach")}
+                  >
+                    <Feather name="plus" size={22} color={colors.muted} />
+                  </Pressable>
+                  {attachmentMenuOpen ? (
+                    <View style={styles.attachMenu}>
+                      <Pressable
+                        onPress={() => {
+                          setAttachmentMenuOpen(false);
+                          void sendImageAttachment(requestContext);
+                        }}
+                        style={styles.attachMenuItem}
+                      >
+                        <Feather name="image" size={16} color={colors.textDark} />
+                        <Text style={styles.attachMenuText}>{t("askPrana.addImage")}</Text>
+                      </Pressable>
+                      <Pressable
+                        onPress={() => {
+                          setAttachmentMenuOpen(false);
+                          void sendDocumentAttachment(requestContext);
+                        }}
+                        style={styles.attachMenuItem}
+                      >
+                        <Feather name="file" size={16} color={colors.textDark} />
+                        <Text style={styles.attachMenuText}>{t("askPrana.addFile")}</Text>
+                      </Pressable>
+                    </View>
+                  ) : null}
+                </View>
                 <TextInput
                   ref={composerInputRef}
                   value={draft}
@@ -1124,85 +1194,43 @@ export default function AskPranaScreen() {
                     color={isRecording ? colors.white : colors.muted}
                   />
                 </Pressable>
-              </View>
-
-                <View style={styles.attachWrap}>
-                <Pressable
-                  onPress={() => setAttachmentMenuOpen((open) => !open)}
-                  disabled={composerBusy}
-                  style={({ pressed }) => [
-                    styles.attachButton,
-                    pressed && styles.pressed,
-                  ]}
-                  accessibilityRole="button"
-                  accessibilityLabel={t("askPrana.attach")}
-                >
-                  <Feather name="paperclip" size={20} color={colors.muted} />
-                </Pressable>
-
-                {attachmentMenuOpen ? (
-                  <View style={styles.attachMenu}>
-                    <Pressable
-                      onPress={() => {
-                        setAttachmentMenuOpen(false);
-                        void sendImageAttachment(requestContext);
-                      }}
-                      style={styles.attachMenuItem}
-                    >
-                      <Feather name="image" size={16} color={colors.textDark} />
-                      <Text style={styles.attachMenuText}>{t("askPrana.addImage")}</Text>
-                    </Pressable>
-                    <Pressable
-                      onPress={() => {
-                        setAttachmentMenuOpen(false);
-                        void sendDocumentAttachment(requestContext);
-                      }}
-                      style={styles.attachMenuItem}
-                    >
-                      <Feather name="file" size={16} color={colors.textDark} />
-                      <Text style={styles.attachMenuText}>{t("askPrana.addFile")}</Text>
-                    </Pressable>
-                  </View>
-                ) : null}
-                </View>
-
-              <Pressable
-                onPress={() => {
-                  if (isRecording || isTranscribing || composerBusy) return;
-                  prepareVoiceModeSession();
-                  setVoiceModeOpen(true);
-                }}
-                disabled={composerBusy || isRecording || isTranscribing}
-                style={({ pressed }) => [
-                  styles.voiceModeButton,
-                  pressed && styles.pressed,
-                ]}
-                accessibilityRole="button"
-                accessibilityLabel={t("askPrana.startVoiceConversation")}
-              >
-                <Feather name="radio" size={18} color={colors.white} />
-              </Pressable>
-
-              <Pressable
-                onPress={handleComposerAction}
-                disabled={!canSend || isRecording || isTranscribing}
-                style={({ pressed }) => [
-                  styles.sendButton,
-                  (!canSend || isRecording || isTranscribing) &&
-                    styles.sendButtonDisabled,
-                  pressed && styles.pressed,
-                ]}
-                accessibilityRole="button"
-                accessibilityLabel={thinkingVisible ? t("askPrana.stopGenerating") : t("askPrana.send")}
-              >
-                {thinkingVisible ? (
-                  <View style={styles.stopIcon} />
+                {canSend ? (
+                  <Pressable
+                    onPress={handleComposerAction}
+                    disabled={isRecording || isTranscribing}
+                    style={({ pressed }) => [
+                      styles.sendButton,
+                      pressed && styles.pressed,
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel={thinkingVisible ? t("askPrana.stopGenerating") : t("askPrana.send")}
+                  >
+                    {thinkingVisible ? (
+                      <View style={styles.stopIcon} />
+                    ) : (
+                      <Feather name="arrow-up" size={18} color={colors.white} />
+                    )}
+                  </Pressable>
                 ) : (
-                  <Feather name="send" size={18} color={colors.white} />
+                  <Pressable
+                    onPress={() => {
+                      if (isRecording || isTranscribing || composerBusy) return;
+                      prepareVoiceModeSession();
+                      setVoiceModeOpen(true);
+                    }}
+                    disabled={composerBusy || isRecording || isTranscribing}
+                    style={({ pressed }) => [
+                      styles.voiceModeButton,
+                      pressed && styles.pressed,
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel={t("askPrana.startVoiceConversation")}
+                  >
+                    <Feather name="radio" size={16} color={colors.white} />
+                  </Pressable>
                 )}
-              </Pressable>
-
               </View>
+            </View>
 
               {canExpandDraft ? (
                 <View style={styles.composerSecondaryActions}>
@@ -1631,10 +1659,8 @@ const styles = StyleSheet.create({
   },
   composerArea: {
     paddingTop: 8,
-    paddingBottom: 8,
-    paddingHorizontal: 18,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
+    paddingBottom: 10,
+    paddingHorizontal: 12,
     backgroundColor: colors.background,
     gap: 10,
     alignItems: "center",
@@ -1747,12 +1773,11 @@ const styles = StyleSheet.create({
   },
   attachWrap: { position: "relative" },
   attachButton: {
-    width: 42,
-    height: 42,
-    borderRadius: 21,
+    width: 34,
+    height: 34,
+    borderRadius: 17,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "rgba(255,255,255,0.04)",
   },
   attachMenu: {
     position: "absolute",
@@ -1790,17 +1815,22 @@ const styles = StyleSheet.create({
     flexShrink: 1,
     flexBasis: 0,
     minWidth: 0,
-    minHeight: 48,
-    borderRadius: 24,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: "#171C23",
-    paddingLeft: 14,
-    paddingRight: 6,
-    paddingVertical: 0,
+    width: "100%",
+    minHeight: 52,
+    borderRadius: 26,
+    backgroundColor: "#2F2F2F",
+    paddingLeft: 6,
+    paddingRight: 8,
+    paddingVertical: 6,
     flexDirection: "row",
     alignItems: "flex-end",
-    gap: 8,
+    gap: 4,
+  },
+  inputShellDesktop: {
+    borderRadius: 28,
+    alignItems: "center",
+    minHeight: 52,
+    paddingVertical: 6,
   },
   textInput: {
     flexGrow: 1,
@@ -1808,6 +1838,7 @@ const styles = StyleSheet.create({
     flexBasis: 0,
     minWidth: 0,
     color: colors.white,
+    backgroundColor: "transparent",
     fontFamily: ASK_PRANA_FONT_FAMILY,
     fontSize: 15,
     lineHeight: 23,
@@ -1816,6 +1847,8 @@ const styles = StyleSheet.create({
     paddingTop: Platform.OS === "ios" ? 12 : 10,
     paddingBottom: Platform.OS === "ios" ? 12 : 10,
     margin: 0,
+    outlineStyle: "none",
+    outlineWidth: 0,
   },
   micButton: {
     width: 34,
@@ -1829,20 +1862,22 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primary,
   },
   voiceModeButton: {
-    width: 46,
-    height: 46,
-    borderRadius: 23,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
     backgroundColor: colors.primary,
     alignItems: "center",
     justifyContent: "center",
+    marginBottom: 1,
   },
   sendButton: {
-    width: 46,
-    height: 46,
-    borderRadius: 23,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
     backgroundColor: colors.primary,
     alignItems: "center",
     justifyContent: "center",
+    marginBottom: 1,
   },
   sendButtonDisabled: { opacity: 0.55 },
   expandDraftButton: {
