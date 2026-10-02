@@ -65,6 +65,7 @@ type Props = {
   onChangeDraft: (value: string) => void;
   onClose: () => void;
   onStartListening: () => Promise<void>;
+  onCancelListening: () => Promise<void>;
   onStopListeningToTranscript: () => Promise<string | null>;
   onAsk: (
     question: string,
@@ -94,6 +95,7 @@ export function AskPranaVoiceModeModal({
   onChangeDraft,
   onClose,
   onStartListening,
+  onCancelListening,
   onStopListeningToTranscript,
   onAsk,
   onLanguageChange,
@@ -101,6 +103,7 @@ export function AskPranaVoiceModeModal({
   const insets = useSafeAreaInsets();
   const [state, setState] = useState<VoiceModeState>("idle");
   const [muted, setMuted] = useState(false);
+  const mutedRef = useRef(false);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [lines, setLines] = useState<TranscriptLine[]>([]);
   const [pulse, setPulse] = useState(0);
@@ -149,6 +152,7 @@ export function AskPranaVoiceModeModal({
       void cleanupSession();
       setLines([]);
       setErrorText(null);
+      mutedRef.current = false;
       setMuted(false);
       return;
     }
@@ -227,15 +231,25 @@ export function AskPranaVoiceModeModal({
           replyLanguage,
         });
         appendLine("assistant", cleanedAnswer);
-        if (muted) {
+        if (mutedRef.current) {
+          setErrorText(null);
           setState("muted");
+          stateRef.current = "muted";
           return;
         }
         setState("speaking");
+        stateRef.current = "speaking";
         console.log("[AskPranaVoice] speak started", { replyLanguage });
         const spoken = await speakAskPranaText(cleanedAnswer, replyLanguage);
         if (!sessionActiveRef.current) return;
-        if (!spoken.spoke) {
+        if (mutedRef.current || spoken.reason === "interrupted") {
+          setErrorText(null);
+          if (mutedRef.current) {
+            setState("muted");
+            stateRef.current = "muted";
+            return;
+          }
+        } else if (!spoken.spoke) {
           console.log("[AskPranaVoice] speak failed", spoken.reason);
           setErrorText(
             spoken.reason ||
@@ -245,8 +259,10 @@ export function AskPranaVoiceModeModal({
           console.log("[AskPranaVoice] speak finished", { provider: spoken.provider });
           setErrorText(null);
         }
-        if (muted || !sessionActiveRef.current) {
-          setState(muted ? "muted" : "idle");
+        if (mutedRef.current || !sessionActiveRef.current) {
+          setErrorText(null);
+          setState("muted");
+          stateRef.current = "muted";
           return;
         }
         setState("listening");
@@ -266,7 +282,6 @@ export function AskPranaVoiceModeModal({
     [
       activeLanguage,
       appendLine,
-      muted,
       onAsk,
       onStartListening,
       requestContext,
@@ -274,7 +289,7 @@ export function AskPranaVoiceModeModal({
   );
 
   const finishListeningTurn = useCallback(async () => {
-    if (!sessionActiveRef.current || muted) return;
+    if (!sessionActiveRef.current || mutedRef.current) return;
     // Immediate UI feedback — do not wait on React isRecording (can be stale).
     setState("processing");
     stateRef.current = "processing";
@@ -300,11 +315,11 @@ export function AskPranaVoiceModeModal({
       // reply had failed, making both mic entry points look broken.
       setErrorText(voiceTurnErrorMessage(error));
     }
-  }, [muted, onStopListeningToTranscript, runTurnFromTranscript]);
+  }, [onStopListeningToTranscript, runTurnFromTranscript]);
 
   const handleOrbPress = useCallback(async () => {
     if (!sessionActiveRef.current || orbPressLockRef.current) return;
-    if (muted) {
+    if (mutedRef.current) {
       Alert.alert("Muted", "Unmute to continue the spoken conversation.");
       return;
     }
@@ -348,16 +363,23 @@ export function AskPranaVoiceModeModal({
   }, [finishListeningTurn, muted, onStartListening]);
 
   const handleMuteToggle = useCallback(async () => {
-    const next = !muted;
+    const next = !mutedRef.current;
+    mutedRef.current = next;
     setMuted(next);
+    setErrorText(null);
     if (next) {
+      await onCancelListening();
       await stopAskPranaSpeech();
+      setErrorText(null);
       setState("muted");
+      stateRef.current = "muted";
       return;
     }
+    await stopAskPranaSpeech();
     setState("listening");
+    stateRef.current = "listening";
     await onStartListening();
-  }, [muted, onStartListening]);
+  }, [onCancelListening, onStartListening]);
 
   const handleEnd = useCallback(async () => {
     await cleanupSession();

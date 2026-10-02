@@ -19,6 +19,17 @@ export type AskPranaSpeakResult = {
 let activePlayer: ReturnType<typeof createAudioPlayer> | null = null;
 let speakGeneration = 0;
 
+function resumeWebSpeech() {
+  if (Platform.OS !== "web" || typeof window === "undefined") return;
+  const synth = window.speechSynthesis;
+  if (!synth) return;
+  try {
+    synth.resume();
+  } catch {
+    // ignore
+  }
+}
+
 export async function stopAskPranaSpeech() {
   speakGeneration += 1;
   try {
@@ -26,6 +37,7 @@ export async function stopAskPranaSpeech() {
   } catch {
     // ignore
   }
+  resumeWebSpeech();
   try {
     if (activePlayer) {
       activePlayer.pause();
@@ -86,6 +98,7 @@ async function speakWithExpoSpeech(
     allowsRecording: false,
     playsInSilentMode: true,
   });
+  resumeWebSpeech();
 
   return await new Promise<AskPranaSpeakResult>((resolve) => {
     let settled = false;
@@ -108,12 +121,17 @@ async function speakWithExpoSpeech(
       },
       onStopped: () =>
         finish({ spoke: false, provider: "expo-speech", reason: "interrupted" }),
-      onError: () =>
+      onError: () => {
+        if (generation !== speakGeneration) {
+          finish({ spoke: false, provider: "expo-speech", reason: "interrupted" });
+          return;
+        }
         finish({
           spoke: false,
           provider: "none",
           reason: `Could not speak in ${option.nativeLabel} on this device.`,
-        }),
+        });
+      },
     });
   });
 }
