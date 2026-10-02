@@ -1,13 +1,9 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useSyncExternalStore } from "react";
 import { Platform } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { useTranslation } from "react-i18next";
 
 import { translateAskPranaHistory } from "../services/ask-prana";
-import {
-  mapToAskPranaLanguageCode,
-  type AskPranaSpeechLanguageCode,
-} from "./ask-prana-language";
+import { type AskPranaSpeechLanguageCode } from "./ask-prana-language";
 
 /**
  * Display-only translation store shared by the Ask Prana sidebar and chat.
@@ -548,10 +544,16 @@ export function requestAskPranaDisplayTranslations(
  * This is intentionally separate from requestAskPranaDisplayTranslations so
  * changing the picker can never be the cause of a translate-history call.
  */
+export function getAskPranaDisplayLanguage(): Language {
+  return activeLanguage;
+}
+
 export function setAskPranaDisplayLanguage(language: Language) {
   if (language === activeLanguage) return;
   startSwitchMetrics(activeLanguage, language);
   activeLanguage = language;
+  version += 1;
+  for (const listener of listeners) listener();
   checkSwitchMetrics();
 }
 
@@ -577,6 +579,8 @@ function visibleAskPranaTexts() {
 
 /** True when every visible string can render in `language` without another request. */
 export function isAskPranaDisplayLanguageReady(language: Language, texts: readonly string[] = visibleAskPranaTexts()) {
+  // Nothing has registered yet, so a click must not switch the menus early.
+  if (visibleTextSets.size === 0) return false;
   return texts.every((text) => !text?.trim() || resolveText(text, language).status === "ready");
 }
 
@@ -626,12 +630,14 @@ export function useAskPranaDisplayTranslation(
     priorityCount?: number;
   },
 ) {
-  const priorityCount = options?.priorityCount;
+  void priority;
+  void options;
   const sourceId = useId();
-  const { i18n } = useTranslation();
-  const language = mapToAskPranaLanguageCode(i18n.resolvedLanguage);
   const storeVersion = useSyncExternalStore(subscribe, getVersion, getVersion);
   const signature = texts.join("␞");
+  // The committed display language, not i18next. i18next changes in the same
+  // update that selects this cache, so menus and chat cannot move apart.
+  const language = storeVersion >= 0 ? activeLanguage : activeLanguage;
 
   const preparedSignatureRef = useRef<string | null>(null);
 
@@ -641,25 +647,15 @@ export function useAskPranaDisplayTranslation(
   }, [signature, sourceId]);
 
   useEffect(() => {
-    // A language click only selects a cache view; it must not start an API call.
-    setAskPranaDisplayLanguage(language);
-  }, [language]);
-
-  useEffect(() => {
     if (!signature || preparedSignatureRef.current === signature) return;
     preparedSignatureRef.current = signature;
     const sources = signature.split("␞");
-    if (priorityCount == null || priorityCount >= sources.length) {
-      requestAskPranaDisplayTranslations(sources, language, priority);
-    } else {
-      requestAskPranaDisplayTranslations(sources.slice(0, priorityCount), language, priority);
-      requestAskPranaDisplayTranslations(sources.slice(priorityCount), language, "background");
+    // Store English, Hindi, and Telugu when the text arrives. A later picker
+    // click only reads this cache and must not start another request.
+    for (const target of LANGUAGES) {
+      requestAskPranaDisplayTranslations(sources, target, "prefetch");
     }
-    // Prepare alternate languages in the background before a picker click.
-    for (const other of LANGUAGES) {
-      if (other !== language) requestAskPranaDisplayTranslations(sources, other, "prefetch");
-    }
-  }, [language, priority, priorityCount, signature]);
+  }, [signature]);
 
   const retryDue = useMemo(() => {
     if (storeVersion < 0 || !signature) return false;
@@ -679,22 +675,21 @@ export function useAskPranaDisplayTranslation(
     if (!retryDue) return;
     const timer = setTimeout(() => {
       const sources = signature.split("␞");
-      requestAskPranaDisplayTranslations(sources, language, priority);
-      for (const other of LANGUAGES) {
-        if (other !== language) requestAskPranaDisplayTranslations(sources, other, "prefetch");
+      for (const target of LANGUAGES) {
+        requestAskPranaDisplayTranslations(sources, target, "prefetch");
       }
     }, RETRY_AFTER_MS);
     return () => clearTimeout(timer);
-  }, [language, priority, retryDue, signature]);
+  }, [retryDue, signature]);
 
   const getStatus = useCallback(
-    (text: string) => (storeVersion >= 0 ? resolveText(text, language).status : "not_loaded"),
-    [language, storeVersion],
+    (text: string) => (storeVersion >= 0 ? resolveText(text, activeLanguage).status : "not_loaded"),
+    [storeVersion],
   );
 
   const displayText = useCallback(
-    (text: string) => (storeVersion >= 0 ? resolveText(text, language).text : text),
-    [language, storeVersion],
+    (text: string) => (storeVersion >= 0 ? resolveText(text, activeLanguage).text : text),
+    [storeVersion],
   );
 
   return { language, displayText, getStatus };

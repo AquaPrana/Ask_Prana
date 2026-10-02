@@ -59,6 +59,7 @@ import {
 import { speakAskPranaText, stopAskPranaSpeech } from "../lib/ask-prana-speech";
 import { type AskPranaRequestContext } from "../services/ask-prana";
 import {
+  getAskPranaDisplayLanguage,
   selectAskPranaLanguageWhenReady,
   useAskPranaDisplayTranslation,
 } from "../lib/ask-prana-display-translation";
@@ -337,6 +338,15 @@ export default function AskPranaScreen() {
   }, [activeSessionId, isAuthLoading, openConversation, routeSessionId]);
 
   useEffect(() => {
+    const shown = getAskPranaDisplayLanguage();
+    if (mapToAskPranaLanguageCode(i18n.resolvedLanguage) === shown) return;
+    // Layout restores the saved language before the chat cache is ready.
+    // Put the menus back until the question, answer, and titles can move together.
+    void setAppLanguage(shown);
+    setPreferredLanguage(shown);
+  }, [i18n.resolvedLanguage]);
+
+  useEffect(() => {
     void (async () => {
       // The app language (loaded before first render) is the single source of
       // truth; the Ask Prana key is only a fallback for older installs.
@@ -348,10 +358,20 @@ export default function AskPranaScreen() {
       const allowed =
         loaded === "en" || loaded === "te" || loaded === "hi" ? loaded : "en";
       await saveAskPranaPreferredLanguage(allowed, { explicit: true });
-      // Same-language changes are a no-op for rendered text, so no flash.
-      await setAppLanguage(allowed);
-      setPreferredLanguage(allowed);
       setTeluguScript(await loadTeluguScriptPreference());
+      // A stored Hindi or Telugu choice must not change the menus until the
+      // open question, answer, and sidebar title can change with them.
+      const shown = getAskPranaDisplayLanguage();
+      if (mapToAskPranaLanguageCode(i18n.language) !== shown) {
+        void setAppLanguage(shown);
+      }
+      setPreferredLanguage(shown);
+      if (allowed !== shown) {
+        selectAskPranaLanguageWhenReady(allowed, (language) => {
+          setPreferredLanguage(language);
+          void setAppLanguage(language);
+        });
+      }
     })();
   }, []);
 
@@ -420,7 +440,7 @@ export default function AskPranaScreen() {
   // The newest texts (what is on screen) are translated first; older ones
   // follow in the background. The chat is also pre-translated into the other
   // languages at idle, so a later switch is served from cache.
-  const { displayText: displayMessageText, getStatus: getMessageTranslationStatus } =
+  const { displayText: displayMessageText } =
     useAskPranaDisplayTranslation(translationSources, "visible", {
       prefetchOtherLanguages: true,
       priorityCount: VISIBLE_TRANSLATION_PRIORITY_COUNT,
@@ -430,20 +450,6 @@ export default function AskPranaScreen() {
   const [displayMessageCache] = useState(
     () => new WeakMap<ChatMessage, { text: string; transcript: string | null | undefined; value: ChatMessage }>(),
   );
-  const translatingMessageIds = useMemo(() => {
-    const pending = (text: string | null | undefined) => {
-      const status = text?.trim() ? getMessageTranslationStatus(text) : "ready";
-      return status === "loading" || status === "not_loaded";
-    };
-    return new Set(
-      conversationMessages
-        .filter((message) =>
-          (isTranslatableMessage(message) && pending(message.text)) || pending(message.transcript),
-        )
-        .map((message) => message.id),
-    );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages, getMessageTranslationStatus]);
   const displayConversationMessages = useMemo(
     () =>
       conversationMessages.map((message) => {
@@ -952,7 +958,6 @@ export default function AskPranaScreen() {
                   onRegenerateAssistantMessage={handleRegenerateAssistantMessage}
                   regenerateDisabled={thinkingVisible || isRecording || isTranscribing}
                   onReadAloud={handleReadAloud}
-                  isTranslating={translatingMessageIds.has(item.id)}
                 />
               )}
             />

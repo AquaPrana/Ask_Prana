@@ -955,11 +955,8 @@ function AskPranaChatMessageBubbleComponent({
   onRegenerateAssistantMessage,
   regenerateDisabled,
   onReadAloud,
-  isTranslating = false,
 }: {
   message: ChatMessage;
-  /** Selected-language text for this message is still on its way. */
-  isTranslating?: boolean;
   isEditingUserMessage?: boolean;
   onBeginEditUserMessage?: (messageId: string) => void;
   onCancelEditUserMessage?: () => void;
@@ -1182,7 +1179,7 @@ function AskPranaChatMessageBubbleComponent({
 
     return (
       <View style={styles.assistantBlock}>
-        <AskPranaAssistantIdentity translating={isTranslating} />
+        <AskPranaAssistantIdentity />
         <View style={styles.assistantFileCard}>
           <View style={styles.assistantFileRow}>
             <View
@@ -1252,7 +1249,7 @@ function AskPranaChatMessageBubbleComponent({
 
   return (
     <View style={styles.assistantBlock}>
-      <AskPranaAssistantIdentity translating={isTranslating} />
+      <AskPranaAssistantIdentity />
       <View style={styles.assistantBubble}>
         <AskPranaFormattedText text={message.text} color={colors.textDark} />
       </View>
@@ -1262,17 +1259,12 @@ function AskPranaChatMessageBubbleComponent({
 }
 
 /** Assistant-only identity row; user messages never render this. */
-function AskPranaAssistantIdentity({ translating = false }: { translating?: boolean }) {
+function AskPranaAssistantIdentity() {
   const { t } = useTranslation();
   return (
     <View style={styles.assistantIdentity}>
       <AskPranaLogo size={24} decorative />
       <Text style={styles.assistantIdentityName}>{t("askPrana.title")}</Text>
-      {translating ? (
-        <Text style={styles.assistantTranslating} accessibilityLiveRegion="polite">
-          {t("askPrana.translating")}
-        </Text>
-      ) : null}
     </View>
   );
 }
