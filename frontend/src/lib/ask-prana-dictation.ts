@@ -52,6 +52,42 @@ export function isWebDictationAvailable(): boolean {
   return getSpeechRecognitionCtor() != null;
 }
 
+/** Keep one wording when the browser sends the same phrase again as it grows. */
+function mergeTranscript(previous: string, next: string): string {
+  const stored = previous.replace(/\s+/g, " ").trim();
+  let incoming = next.replace(/\s+/g, " ").trim();
+  if (!stored) return incoming;
+  if (!incoming) return stored;
+  const storedKey = stored.toLowerCase();
+  let incomingKey = incoming.toLowerCase();
+  if (storedKey === incomingKey) return stored.length >= incoming.length ? stored : incoming;
+  if (incomingKey.startsWith(storedKey)) {
+    let rest = incoming.slice(stored.length).trim();
+    let restKey = rest.toLowerCase();
+    while (restKey.startsWith(storedKey)) {
+      rest = rest.slice(stored.length).trim();
+      restKey = rest.toLowerCase();
+    }
+    if (!rest || storedKey.endsWith(restKey)) return stored;
+    return mergeTranscript(stored, rest);
+  }
+  if (incomingKey.endsWith(storedKey)) return incoming;
+  if (storedKey.startsWith(incomingKey) || storedKey.endsWith(incomingKey)) return stored;
+
+  const storedWords = stored.split(" ");
+  const incomingWords = incoming.split(" ");
+  const max = Math.min(storedWords.length, incomingWords.length);
+  for (let size = max; size > 0; size -= 1) {
+    const tail = storedWords.slice(storedWords.length - size).join(" ").toLowerCase();
+    const head = incomingWords.slice(0, size).join(" ").toLowerCase();
+    if (tail === head) {
+      const added = incomingWords.slice(size).join(" ");
+      return added ? `${stored} ${added}` : stored;
+    }
+  }
+  return `${stored} ${incoming}`;
+}
+
 /**
  * Browser-native speech-to-text (no OpenAI). Used for Ask Prana composer
  * dictation on web when cloud transcription is unavailable or preferred.
@@ -72,29 +108,33 @@ export function startWebDictation(
   recognition.interimResults = true;
   recognition.maxAlternatives = 1;
 
-  let finalText = "";
+  let committedText = "";
+  let sessionFinal = "";
   let interimText = "";
   let settled = false;
   let stopRequested = false;
   let resolveStop: ((value: string) => void) | null = null;
 
+  const currentTranscript = () => {
+    const spoken = mergeTranscript(committedText, sessionFinal);
+    return interimText ? mergeTranscript(spoken, interimText) : spoken;
+  };
+
   const emitPartial = () => {
-    const combined = `${finalText} ${interimText}`.replace(/\s+/g, " ").trim();
-    handlers.onPartial(combined);
+    handlers.onPartial(currentTranscript());
   };
 
   recognition.onresult = (event) => {
+    let finals = "";
     let interim = "";
-    for (let i = event.resultIndex; i < event.results.length; i += 1) {
+    for (let i = 0; i < event.results.length; i += 1) {
       const result = event.results[i];
       const piece = result?.[0]?.transcript?.trim() ?? "";
       if (!piece) continue;
-      if (result.isFinal) {
-        finalText = `${finalText} ${piece}`.replace(/\s+/g, " ").trim();
-      } else {
-        interim = `${interim} ${piece}`.trim();
-      }
+      if (result.isFinal) finals = mergeTranscript(finals, piece);
+      else interim = mergeTranscript(interim, piece);
     }
+    sessionFinal = finals;
     interimText = interim;
     emitPartial();
   };
@@ -118,6 +158,9 @@ export function startWebDictation(
   recognition.onend = () => {
     if (settled) return;
     if (!stopRequested) {
+      committedText = currentTranscript();
+      sessionFinal = "";
+      interimText = "";
       // Browser sometimes ends mid-session — restart while still recording.
       try {
         recognition.start();
@@ -127,7 +170,7 @@ export function startWebDictation(
       }
     }
     settled = true;
-    const text = `${finalText} ${interimText}`.replace(/\s+/g, " ").trim();
+    const text = currentTranscript();
     resolveStop?.(text);
     resolveStop = null;
   };
@@ -143,7 +186,7 @@ export function startWebDictation(
     stop: () =>
       new Promise<string>((resolve) => {
         if (settled) {
-          resolve(`${finalText} ${interimText}`.replace(/\s+/g, " ").trim());
+          resolve(currentTranscript());
           return;
         }
         stopRequested = true;
@@ -152,7 +195,7 @@ export function startWebDictation(
           recognition.stop();
         } catch {
           settled = true;
-          resolve(`${finalText} ${interimText}`.replace(/\s+/g, " ").trim());
+          resolve(currentTranscript());
         }
         // Safety: if onend never fires
         setTimeout(() => {
@@ -163,7 +206,7 @@ export function startWebDictation(
             } catch {
               // ignore
             }
-            resolve(`${finalText} ${interimText}`.replace(/\s+/g, " ").trim());
+            resolve(currentTranscript());
           }
         }, 2500);
       }),
