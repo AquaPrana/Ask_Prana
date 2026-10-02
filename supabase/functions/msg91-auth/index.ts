@@ -302,21 +302,37 @@ async function verifyAccessToken(accessToken: string, credentials: { widgetId: s
   return null;
 }
 
-function otpErrorMessage(body: unknown): string {
+function otpFailure(body: unknown): { error: string; code?: "widget_unreachable" } {
   const text = JSON.stringify(body ?? "").toLowerCase();
   if (/ipblocked|ip blocked/.test(text)) {
-    return "MSG91 blocked this network. Open OTP, then Tokens, open your token, and clear any blocked IP on the IPs tab. Also turn off Captcha on the widget, then try again.";
+    return {
+      error: "MSG91 blocked this network. Open OTP, then Tokens, open your token, and clear any blocked IP on the IPs tab. Also turn off Captcha on the widget, then try again.",
+      code: "widget_unreachable",
+    };
   }
-  if (/expired/.test(text)) return "This OTP has expired. Please request a new OTP.";
-  if (/invalid|wrong|not match|incorrect|does not match|already verified|already used/.test(text)) {
-    return "Incorrect OTP. Please check the code and try again.";
+  if (/authenticationfailure|authentication failure|invalid auth|authkey/.test(text)) {
+    return {
+      error: "Verification could not be completed from this network. Please try again.",
+      code: "widget_unreachable",
+    };
   }
-  return "Unable to verify OTP. Please try again.";
+  if (/expired|already verified|already used/.test(text)) {
+    return { error: "This OTP has expired. Please request a new OTP." };
+  }
+  if (/wrong otp|otp invalid|invalid otp|not match|incorrect otp|does not match/.test(text)) {
+    return { error: "Incorrect OTP. Please check the code and try again." };
+  }
+  return { error: "Unable to verify OTP. Please try again." };
 }
 
-function widgetUnreachable(body: unknown): boolean {
-  const text = JSON.stringify(body ?? "").toLowerCase();
-  return /ipblocked|ip blocked|authenticationfailure|authentication failure|invalid auth|authkey/.test(text);
+function requestIdFrom(body: unknown): string {
+  if (!body || typeof body !== "object") return "";
+  const record = body as Record<string, unknown>;
+  for (const key of ["message", "request_id", "requestId", "reqId"]) {
+    const value = record[key];
+    if (typeof value === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(value.trim())) return value.trim();
+  }
+  return "";
 }
 
 /**
@@ -336,11 +352,8 @@ async function verifyOtpWithMsg91(
   const body = await result.json().catch(() => null);
   if (!isMsg91Success(body)) {
     console.warn("[msg91-auth] verifyOtp rejected", result.status, msg91Meta(body));
-    return {
-      identity: null,
-      error: otpErrorMessage(body),
-      code: widgetUnreachable(body) ? "widget_unreachable" : "otp_rejected",
-    };
+    const failure = otpFailure(body);
+    return { identity: null, error: failure.error, code: failure.code ?? "otp_rejected" };
   }
   const jwt = findJwt(body);
   const payload = jwt ? decodeJwtPayload(jwt) : null;
@@ -532,6 +545,26 @@ Deno.serve(async (req) => {
       otpVerified?: unknown;
     } | null;
     const action = typeof input?.action === "string" ? input.action : "";
+
+    if (action === "send-otp") {
+      const phone = typeof input?.phone === "string" ? canonicalPhone(input.phone) : null;
+      const email = typeof input?.email === "string" ? canonicalEmail(input.email) : null;
+      const identifier = phone ? phone.slice(1) : email;
+      if (!identifier) return response({ success: false, error: "Please enter a valid email or mobile number." }, 400);
+      const sent = await fetch(`${WIDGET_API}/sendOtp`, {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ widgetId: credentials.widgetId, tokenAuth: credentials.tokenAuth, identifier }),
+      });
+      const body = await sent.json().catch(() => null);
+      if (!isMsg91Success(body)) {
+        const failure = otpFailure(body);
+        return response({ success: false, error: failure.error, code: failure.code }, failure.code === "widget_unreachable" ? 403 : 400);
+      }
+      const reqId = requestIdFrom(body);
+      if (!reqId) return response({ success: false, error: "Unable to send OTP. Please try again." }, 502);
+      return response({ success: true, reqId });
+    }
     // Frontend flags are ignored. Existence is decided only after MSG91 verification.
     void input?.isNewUser;
     void input?.verified;

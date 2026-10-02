@@ -1,3 +1,5 @@
+import { supabase } from "../lib/supabase";
+
 const WIDGET_API = "https://control.msg91.com/api/v5/widget";
 
 const IP_SECURITY_MESSAGE =
@@ -47,9 +49,34 @@ function failureText(body: Msg91Body | null, fallback: string): string {
   if (/limit|too many|rate|max retry|maximum/.test(text)) {
     return "Too many requests. Please wait a moment and try again.";
   }
-  if (/expired/.test(text)) return "expired";
-  if (/invalid otp|otp invalid|wrong otp|not match|incorrect|does not match/.test(text)) return "invalid";
+  if (/authenticationfailure|authentication failure|invalid auth|authkey/.test(text)) {
+    return "Verification could not be completed from this network. Please try again.";
+  }
+  if (/expired|already verified|already used/.test(text)) {
+    return "This OTP has expired. Please request a new OTP.";
+  }
+  if (/wrong otp|otp invalid|invalid otp|not match|incorrect otp|does not match/.test(text)) {
+    return "Incorrect OTP. Please check the code and try again.";
+  }
   return fallback;
+}
+
+function networkBlocked(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /blocked this network|ipblocked|ip blocked|could not be completed from this network|authentication failure|invalid auth/i.test(message);
+}
+
+/** Sends from Supabase when the phone's own network is blocked by MSG91. */
+async function sendOtpFromServer(body: { phone?: string; email?: string }): Promise<{ reqId: string }> {
+  const { data, error } = await supabase.functions.invoke("msg91-auth", {
+    body: { action: "send-otp", ...body },
+  });
+  const payload = data as { success?: boolean; reqId?: unknown; error?: unknown } | null;
+  if (error || payload?.success !== true || typeof payload.reqId !== "string") {
+    const message = typeof payload?.error === "string" ? payload.error : "Unable to send OTP. Please try again.";
+    throw new Error(message);
+  }
+  return { reqId: payload.reqId };
 }
 
 async function widgetPost(path: string, payload: Record<string, unknown>): Promise<Msg91Body | null> {
@@ -93,7 +120,11 @@ export async function sendMsg91Otp(
     const next = await widgetPost(secondary, { ...credentials, identifier });
     if (isSuccess(next) || next) sent = isSuccess(next) ? next : sent;
   }
-  if (!isSuccess(sent)) throw new Error(failureText(sent, "Unable to send OTP. Please try again."));
+  if (!isSuccess(sent)) {
+    const message = failureText(sent, "Unable to send OTP. Please try again.");
+    if (networkBlocked(message)) return await sendOtpFromServer({ phone });
+    throw new Error(message);
+  }
   const issuedReqId = requestIdFrom(sent);
   if (!issuedReqId) throw new Error("Unable to send OTP. Please try again.");
   return { reqId: issuedReqId };
@@ -143,7 +174,11 @@ export async function sendMsg91EmailOtp(email: string, reqId?: string): Promise<
   }
 
   const sent = await widgetPost("/sendOtp", { ...credentials, identifier });
-  if (!isSuccess(sent)) throw new Error(failureText(sent, "Unable to send the verification code. Please try again."));
+  if (!isSuccess(sent)) {
+    const message = failureText(sent, "Unable to send the verification code. Please try again.");
+    if (networkBlocked(message)) return await sendOtpFromServer({ email: identifier });
+    throw new Error(message);
+  }
   const issuedReqId = requestIdFrom(sent);
   if (!issuedReqId) throw new Error("Unable to send the verification code. Please try again.");
   return { reqId: issuedReqId };
