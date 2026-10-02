@@ -273,6 +273,10 @@ export async function saveAskPranaMessage(
       userId: input.userId,
       role: input.role,
       content: input.content ?? "",
+      messageType: input.messageType,
+      filePath: input.filePath ?? null,
+      fileName: input.fileName ?? null,
+      mimeType: input.mimeType ?? null,
     });
     if (!saved.message) return { message: null, error: new Error("Unable to save message.") };
     return {

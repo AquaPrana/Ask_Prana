@@ -1272,6 +1272,36 @@ type PreparedAttachment = {
   failure: "image" | "file" | "unsupported" | null;
 };
 
+function storedMessageType(value: unknown) {
+  return value === "image" || value === "document" || value === "audio" ? value : "text";
+}
+
+function storedFileLabel(value: unknown) {
+  if (typeof value !== "string") return null;
+  const label = value.trim();
+  return label ? label.slice(0, 180) : null;
+}
+
+function storedFilePath(value: unknown) {
+  if (typeof value !== "string") return null;
+  const path = value.trim();
+  if (
+    !path ||
+    path.includes("..") ||
+    path.includes("://") ||
+    path.startsWith("file:") ||
+    path.startsWith("content:") ||
+    path.startsWith("ph:") ||
+    path.startsWith("blob:")
+  ) {
+    return null;
+  }
+  if (!path.startsWith("images/") && !path.startsWith("documents/") && !path.startsWith("audio/")) {
+    return null;
+  }
+  return path.slice(0, 500);
+}
+
 async function handleConversations(
   supabase: SupabaseClient,
   userId: string,
@@ -1373,7 +1403,7 @@ async function handleConversations(
   if (op === "messages") {
     const { data, error } = await supabase
       .from("chat_messages")
-      .select("id, session_id, user_id, role, content, created_at")
+      .select("id, session_id, user_id, role, content, message_type, file_path, file_name, mime_type, created_at")
       .eq("session_id", sessionId)
       .eq("user_id", userId)
       .order("created_at", { ascending: true });
@@ -1384,10 +1414,23 @@ async function handleConversations(
   if (op === "save") {
     const role = body.role === "assistant" ? "assistant" : "user";
     const content = typeof body.content === "string" ? body.content : "";
+    const messageType = storedMessageType(body.messageType);
+    const filePath = storedFilePath(body.filePath);
+    const fileName = storedFileLabel(body.fileName);
+    const mimeType = storedFileLabel(body.mimeType);
     const { data: message, error } = await supabase
       .from("chat_messages")
-      .insert({ session_id: sessionId, user_id: userId, role, content })
-      .select("id, session_id, user_id, role, content, created_at")
+      .insert({
+        session_id: sessionId,
+        user_id: userId,
+        role,
+        content,
+        message_type: filePath ? messageType : "text",
+        file_path: filePath,
+        file_name: filePath ? fileName : null,
+        mime_type: filePath ? mimeType : null,
+      })
+      .select("id, session_id, user_id, role, content, message_type, file_path, file_name, mime_type, created_at")
       .single();
     if (error || !message) return jsonResponse({ error: "Unable to save message." }, 500);
     const currentTitle = typeof owned.title === "string" ? owned.title.trim() : "";
