@@ -69,7 +69,10 @@ export function friendlyOtpVerifyError(
   if (/IP Security|request a new OTP|Unable to sign in|unavailable|Verification failed/i.test(message)) {
     return message;
   }
-  const lower = message.toLowerCase();
+  const lower = message.toLowerCase().replace(/[_-]+/g, " ");
+  if (/already\s*verified|verified\s*already/.test(lower)) {
+    return "This OTP has expired. Please request a new OTP.";
+  }
   const code = String(record.code ?? "").toLowerCase();
   if (message && lower !== "invalid" && lower !== "expired" && !/expired|invalid|token/.test(lower)) {
     return message;
@@ -208,13 +211,14 @@ async function verifyFailure(error: unknown, data: VerifyPayload | null): Promis
  * It is not trusted.
  */
 export async function completeVerifiedLogin(
-  proof: { reqId: string; otp: string },
+  proof: { reqId: string; otp: string; otpBind?: string },
   claimed: { phone?: string; email?: string },
 ): Promise<VerifyResult> {
   const { data, error } = await invokeVerify({
     action: "verify",
     reqId: proof.reqId,
     otp: proof.otp,
+    otpBind: proof.otpBind,
     phone: claimed.phone,
     email: claimed.email,
   });

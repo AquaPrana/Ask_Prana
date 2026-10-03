@@ -458,16 +458,24 @@ export function maskEmail(email: string) {
 // ---------------------------------------------------------------------------
 
 const EMAIL_OTP_STORAGE_KEY = "ask-prana-email-otp";
-let pendingEmailOtp: { email: string; reqId: string } | null = null;
+let pendingEmailOtp: { email: string; reqId: string; otpBind?: string } | null = null;
+let emailVerifyInflight: {
+  key: string;
+  task: Promise<{ userId: string | null; isNewUser: boolean; error: string | null; cause: unknown }>;
+} | null = null;
 
-function readPendingEmailOtp(): { email: string; reqId: string } | null {
+function readPendingEmailOtp(): { email: string; reqId: string; otpBind?: string } | null {
   if (typeof sessionStorage === "undefined") return pendingEmailOtp;
   try {
     const raw = sessionStorage.getItem(EMAIL_OTP_STORAGE_KEY);
     if (!raw) return pendingEmailOtp;
-    const parsed = JSON.parse(raw) as { email?: unknown; reqId?: unknown };
+    const parsed = JSON.parse(raw) as { email?: unknown; reqId?: unknown; otpBind?: unknown };
     if (typeof parsed.email === "string" && typeof parsed.reqId === "string") {
-      pendingEmailOtp = { email: parsed.email, reqId: parsed.reqId };
+      pendingEmailOtp = {
+        email: parsed.email,
+        reqId: parsed.reqId,
+        otpBind: typeof parsed.otpBind === "string" ? parsed.otpBind : undefined,
+      };
     }
   } catch {
     // Ignore a corrupt saved request and send a new code.
@@ -475,7 +483,7 @@ function readPendingEmailOtp(): { email: string; reqId: string } | null {
   return pendingEmailOtp;
 }
 
-function writePendingEmailOtp(value: { email: string; reqId: string } | null) {
+function writePendingEmailOtp(value: { email: string; reqId: string; otpBind?: string } | null) {
   pendingEmailOtp = value;
   if (typeof sessionStorage === "undefined") return;
   try {
@@ -502,7 +510,7 @@ export async function sendEmailLoginCode(email: string): Promise<{
       normalized,
       pending?.email === normalized ? pending.reqId : undefined,
     );
-    writePendingEmailOtp({ email: normalized, reqId: sent.reqId });
+    writePendingEmailOtp({ email: normalized, reqId: sent.reqId, otpBind: sent.otpBind });
     return { error: null, cause: null };
   } catch (error) {
     return {
@@ -526,8 +534,30 @@ export async function verifyEmailLoginCode(email: string, code: string): Promise
     return { userId: null, isNewUser: false, error: "Please request a new code.", cause: null };
   }
 
+  const key = `${normalized}\n${code.trim()}\n${reqId}`;
+  if (emailVerifyInflight?.key === key) return emailVerifyInflight.task;
+  const task = verifyEmailLoginOnce(normalized, code.trim(), reqId, pending?.otpBind);
+  emailVerifyInflight = { key, task };
   try {
-    const result = await completeVerifiedLogin({ reqId, otp: code.trim() }, { email: normalized });
+    return await task;
+  } finally {
+    if (emailVerifyInflight?.task === task) emailVerifyInflight = null;
+  }
+}
+
+async function verifyEmailLoginOnce(
+  normalized: string,
+  code: string,
+  reqId: string,
+  otpBind: string | undefined,
+): Promise<{
+  userId: string | null;
+  isNewUser: boolean;
+  error: string | null;
+  cause: unknown;
+}> {
+  try {
+    const result = await completeVerifiedLogin({ reqId, otp: code, otpBind }, { email: normalized });
     if (result.error) {
       return { userId: null, isNewUser: false, error: result.error.message, cause: result.error };
     }

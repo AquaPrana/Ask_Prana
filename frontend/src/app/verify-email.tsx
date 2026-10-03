@@ -254,8 +254,10 @@ export default function VerifyEmailScreen() {
     setVerified(true);
   }, [codeLength, finishEmailLogin, loginMode, targetEmail, verified]);
 
-  // Auto-verify once the full code is entered or pasted.
+  // Login verifies only from the button, so the code is sent once.
+  // Email change still verifies when the code is complete.
   useEffect(() => {
+    if (loginMode) return;
     if (code.length < codeLength) {
       lastAutoVerifiedRef.current = "";
       return;
@@ -264,7 +266,7 @@ export default function VerifyEmailScreen() {
       lastAutoVerifiedRef.current = code;
       void verify(code);
     }
-  }, [code, codeLength, verify]);
+  }, [code, codeLength, loginMode, verify]);
 
   const resend = async () => {
     if (resendSeconds > 0 || resending || requestLockRef.current) return;

@@ -341,7 +341,7 @@ export default function EditProfileScreen() {
       }
 
       setSaveError(null);
-      setSaveNotice("Profile saved successfully.");
+      router.replace("/ask-prana" as never);
     } finally {
       setSaving(false);
     }
@@ -474,18 +474,20 @@ export default function EditProfileScreen() {
         </Pressable>
         {saveNotice ? <Text style={styles.saveNotice} accessibilityLiveRegion="polite">{saveNotice}</Text> : null}
         {saveError ? <Text style={styles.saveError} accessibilityLiveRegion="polite">{saveError}</Text> : null}
-        <Pressable
-          onPress={() => {
-            setLogoutError(null);
-            setLogoutConfirmOpen(true);
-          }}
-          style={({ pressed, hovered }) => [styles.logoutButton, hovered && styles.logoutButtonHovered, pressed && styles.logoutButtonPressed]}
-          accessibilityRole="button"
-          accessibilityLabel={t("profile.logout")}
-        >
-          <Feather name="log-out" size={17} color={colors.danger} />
-          <Text style={styles.logoutText}>{t("profile.logout")}</Text>
-        </Pressable>
+        {registerMode ? null : (
+          <Pressable
+            onPress={() => {
+              setLogoutError(null);
+              setLogoutConfirmOpen(true);
+            }}
+            style={({ pressed, hovered }) => [styles.logoutButton, hovered && styles.logoutButtonHovered, pressed && styles.logoutButtonPressed]}
+            accessibilityRole="button"
+            accessibilityLabel={t("profile.logout")}
+          >
+            <Feather name="log-out" size={17} color={colors.danger} />
+            <Text style={styles.logoutText}>{t("profile.logout")}</Text>
+          </Pressable>
+        )}
       </ScrollView>
       <Modal visible={logoutConfirmOpen} transparent animationType="fade" onRequestClose={() => !loggingOut && setLogoutConfirmOpen(false)}>
         <View style={styles.dialogBackdrop}>
@@ -534,7 +536,7 @@ const styles = StyleSheet.create({
   resendLinkPressed: { opacity: 0.6 },
   resendLinkText: { color: colors.primary, fontSize: 13, lineHeight: 18, fontWeight: "600" },
   hintText: { color: colors.muted, fontSize: 13, lineHeight: 18, fontWeight: "400" },
-  saveButton: { minHeight: 46, marginTop: 8, borderRadius: 8, alignItems: "center", justifyContent: "center", backgroundColor: colors.primary },
+  saveButton: { minHeight: 46, marginTop: 8, borderRadius: 8, alignItems: "center", justifyContent: "center", backgroundColor: "#0F766E" },
   saveButtonDisabled: { opacity: 0.6 },
   saveText: { color: colors.text, fontSize: 14, lineHeight: 20, fontWeight: "600" },
   saveNotice: { color: colors.success, fontSize: 15, lineHeight: 21, fontWeight: "600", textAlign: "center" },

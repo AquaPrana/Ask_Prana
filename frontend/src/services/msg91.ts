@@ -28,13 +28,16 @@ async function authError(error: unknown, data: { error?: unknown } | null, fallb
   return fallback;
 }
 
-async function requestAuth(body: Record<string, unknown>, fallback: string): Promise<{ reqId: string }> {
+async function requestAuth(body: Record<string, unknown>, fallback: string): Promise<{ reqId: string; otpBind?: string }> {
   const { data, error } = await supabase.functions.invoke("msg91-auth", { body });
-  const payload = data as { success?: boolean; reqId?: unknown; error?: unknown } | null;
+  const payload = data as { success?: boolean; reqId?: unknown; otpBind?: unknown; error?: unknown } | null;
   if (error || payload?.success !== true || typeof payload.reqId !== "string") {
     throw new Error(await authError(error, payload, fallback));
   }
-  return { reqId: payload.reqId };
+  return {
+    reqId: payload.reqId,
+    otpBind: typeof payload.otpBind === "string" ? payload.otpBind : undefined,
+  };
 }
 
 export async function sendMsg91Otp(
@@ -49,7 +52,7 @@ export async function sendMsg91Otp(
   );
 }
 
-export async function sendMsg91EmailOtp(email: string, reqId?: string): Promise<{ reqId: string }> {
+export async function sendMsg91EmailOtp(email: string, reqId?: string): Promise<{ reqId: string; otpBind?: string }> {
   const identifier = email.trim().toLowerCase();
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(identifier)) {
     throw new Error("Please enter a valid email address.");

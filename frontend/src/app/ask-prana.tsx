@@ -1890,7 +1890,7 @@ const styles = StyleSheet.create({
     zIndex: 2,
   },
   micButtonActive: {
-    backgroundColor: colors.primary,
+    backgroundColor: "#0F766E",
   },
   voiceModeButton: {
     width: 32,
@@ -1962,7 +1962,7 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
   },
   recordingStopButton: {
-    backgroundColor: colors.primary,
+    backgroundColor: "#0F766E",
   },
   recordingCancelText: {
     color: colors.textDark,
@@ -1979,7 +1979,7 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
   recordingHint: {
-    color: colors.primary,
+    color: "#0F766E",
     fontFamily: ASK_PRANA_FONT_FAMILY,
     fontSize: 12,
     lineHeight: 16,

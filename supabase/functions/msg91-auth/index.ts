@@ -138,6 +138,30 @@ async function hmacKey() {
   );
 }
 
+async function signPayload(payload: Record<string, unknown>): Promise<string> {
+  const body = base64UrlEncode(new TextEncoder().encode(JSON.stringify(payload)));
+  const key = await hmacKey();
+  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
+  return `${body}.${base64UrlEncode(new Uint8Array(signature))}`;
+}
+
+async function readSignedPayload(token: string): Promise<Record<string, unknown> | null> {
+  const [body, signature] = token.split(".");
+  if (!body || !signature) return null;
+  const sigBytes = base64UrlDecode(signature);
+  if (!sigBytes) return null;
+  const key = await hmacKey();
+  const valid = await crypto.subtle.verify("HMAC", key, sigBytes, new TextEncoder().encode(body));
+  if (!valid) return null;
+  const payloadBytes = base64UrlDecode(body);
+  if (!payloadBytes) return null;
+  try {
+    return JSON.parse(new TextDecoder().decode(payloadBytes)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 async function signRegistration(identity: VerifiedIdentity): Promise<string> {
   const payload = {
     purpose: "register",
@@ -149,6 +173,27 @@ async function signRegistration(identity: VerifiedIdentity): Promise<string> {
   const key = await hmacKey();
   const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body));
   return `${body}.${base64UrlEncode(new Uint8Array(signature))}`;
+}
+
+async function signOtpBind(reqId: string, identity: VerifiedIdentity): Promise<string> {
+  return await signPayload({
+    purpose: "otp",
+    reqId,
+    phone: identity.phone,
+    email: identity.email,
+    exp: Date.now() + REGISTRATION_MINUTES * 60 * 1000,
+  });
+}
+
+async function readOtpBind(token: string): Promise<{ reqId: string; phone: string | null; email: string | null } | null> {
+  const payload = await readSignedPayload(token);
+  if (!payload || payload.purpose !== "otp") return null;
+  if (typeof payload.exp !== "number" || payload.exp < Date.now()) return null;
+  if (typeof payload.reqId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(payload.reqId)) return null;
+  const phone = typeof payload.phone === "string" ? canonicalPhone(payload.phone) : null;
+  const email = typeof payload.email === "string" ? canonicalEmail(payload.email) : null;
+  if (!phone && !email) return null;
+  return { reqId: payload.reqId, phone, email };
 }
 
 async function readRegistration(token: string): Promise<VerifiedIdentity | null> {
@@ -191,27 +236,32 @@ function decodeJwtPayload(token: string): Record<string, unknown> | null {
   }
 }
 
+function emailInText(value: string): string | null {
+  const match = value.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
+  return match ? canonicalEmail(match[0]) : null;
+}
+
 function identityFromUnknown(value: unknown, depth = 0): VerifiedIdentity {
   const found: VerifiedIdentity = { phone: null, email: null };
   if (depth > 5 || value == null) return found;
   if (typeof value === "string") {
-    const email = canonicalEmail(value);
+    const email = emailInText(value);
     const phone = canonicalPhone(value);
-    if (email && value.includes("@")) found.email = email;
+    if (email) found.email = email;
     else if (phone) found.phone = phone;
     return found;
   }
   if (typeof value !== "object") return found;
   for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
     if (typeof nested === "string" && /email/i.test(key)) {
-      found.email = canonicalEmail(nested) ?? found.email;
+      found.email = emailInText(nested) ?? found.email;
     } else if (typeof nested === "string" && /identifier|mobile|phone/i.test(key)) {
-      if (nested.includes("@")) found.email = canonicalEmail(nested) ?? found.email;
+      if (nested.includes("@")) found.email = emailInText(nested) ?? found.email;
       else found.phone = canonicalPhone(nested) ?? found.phone;
     } else if (typeof nested === "string" && key.toLowerCase() === "message") {
       const trimmed = nested.trim();
       const looksLikeJwt = trimmed.split(".").length === 3 && trimmed.length > 20;
-      if (!looksLikeJwt && trimmed.includes("@")) found.email = canonicalEmail(trimmed) ?? found.email;
+      if (!looksLikeJwt && trimmed.includes("@")) found.email = emailInText(trimmed) ?? found.email;
       else if (!looksLikeJwt) found.phone = canonicalPhone(trimmed) ?? found.phone;
     } else if (nested && typeof nested === "object") {
       const inner = identityFromUnknown(nested, depth + 1);
@@ -270,10 +320,14 @@ function mergeIdentity(primary: VerifiedIdentity, extra: VerifiedIdentity): Veri
 
 function identityFromAccessToken(accessToken: string, body: unknown, widgetId: string): VerifiedIdentity | null {
   const payload = decodeJwtPayload(accessToken);
+  // MSG91's verifyAccessToken success body is the verified phone or email.
+  // A widget-id or expiry claim must not discard that identifier.
+  const fromBody = identityFromUnknown(body);
+  if (fromBody.phone || fromBody.email) return fromBody;
   if (!tokenStillValid(payload) || !widgetMatches(payload, widgetId)) return null;
-  const identity = mergeIdentity(identityFromUnknown(body), identityFromUnknown(payload));
-  if (!identity.phone && !identity.email) return null;
-  return identity;
+  const fromToken = identityFromUnknown(payload);
+  if (!fromToken.phone && !fromToken.email) return null;
+  return fromToken;
 }
 
 /** Confirms the widget JWT with MSG91. The widget token is not an authkey, so it is never sent as one. */
@@ -318,9 +372,23 @@ function msg91Message(body: unknown): string {
   return typeof message === "string" ? message.trim() : "";
 }
 
+function msg91FailureText(body: unknown): string {
+  const message = msg91Message(body);
+  return `${message} ${JSON.stringify(body ?? "")}`.toLowerCase();
+}
+
+function textSaysAlreadyVerified(text: string): boolean {
+  const normalized = text.toLowerCase().replace(/[_-]+/g, " ");
+  return /already\s*verified/.test(normalized) || /verified\s*already/.test(normalized);
+}
+
+function otpAlreadyVerified(body: unknown): boolean {
+  return textSaysAlreadyVerified(msg91FailureText(body));
+}
+
 function otpFailure(body: unknown, fallback: string): { error: string; code?: string } {
   const message = msg91Message(body);
-  const text = `${message} ${JSON.stringify(body ?? "")}`.toLowerCase();
+  const text = msg91FailureText(body);
   if (/authkey is missing|widget id is missing/.test(text)) {
     return { error: message, code: "missing_authkey" };
   }
@@ -330,11 +398,14 @@ function otpFailure(body: unknown, fallback: string): { error: string; code?: st
   if (/authenticationfailure|authentication failure/.test(text)) {
     return { error: message || "MSG91 rejected the OTP request (AuthenticationFailure).", code: "auth_rejected" };
   }
-  if (/expired|already verified|already used/.test(text)) {
+  if (/expired|already used/.test(text)) {
     return { error: "This OTP has expired. Please request a new OTP.", code: "otp_expired" };
   }
   if (/wrong otp|otp invalid|invalid otp|not match|incorrect otp|does not match/.test(text)) {
     return { error: "Incorrect OTP. Please check the code and try again.", code: "otp_mismatch" };
+  }
+  if (textSaysAlreadyVerified(text)) {
+    return { error: "This OTP has expired. Please request a new OTP.", code: "already_verified" };
   }
   if (message && message.length < 180 && !/eyJ|authkey|tokenauth/i.test(message)) {
     return { error: message };
@@ -361,24 +432,28 @@ async function verifyOtpWithMsg91(
   otp: string,
 ): Promise<{ identity: VerifiedIdentity | null; error: string | null; code?: string }> {
   const body = await msg91Widget("/verifyOtp", { reqId, otp });
-  if (!isMsg91Success(body)) {
+  if (!isMsg91Success(body) || otpAlreadyVerified(body)) {
+    if (otpAlreadyVerified(body)) {
+      return { identity: null, error: null, code: "already_verified" };
+    }
     console.warn("[msg91-auth] verifyOtp rejected", msg91Meta(body));
     const failure = otpFailure(body, "MSG91 could not verify the code.");
+    if (failure.code === "already_verified" || textSaysAlreadyVerified(failure.error)) {
+      return { identity: null, error: null, code: "already_verified" };
+    }
     return { identity: null, error: failure.error, code: failure.code ?? "otp_rejected" };
   }
   const jwt = findJwt(body);
   const payload = jwt ? decodeJwtPayload(jwt) : null;
-  if (payload && (!tokenStillValid(payload) || !widgetMatches(payload, widgetId()))) {
-    return { identity: null, error: "Verification failed. Please request a new code." };
-  }
   let identity = mergeIdentity(identityFromUnknown(body), identityFromUnknown(payload));
   if (jwt) {
     const confirmed = await verifyAccessToken(jwt);
-    if (confirmed) identity = confirmed;
+    if (confirmed) identity = mergeIdentity(confirmed, identity);
   }
   if (!identity.phone && !identity.email) {
-    console.warn("[msg91-auth] verified otp had no identifier", msg91Meta(body));
-    return { identity: null, error: "Verification failed. Please request a new code." };
+    const reason = payload && !widgetMatches(payload, widgetId()) ? "widget_mismatch" : "no_identifier";
+    console.warn("[msg91-auth] verified otp had no identifier", msg91Meta(body), reason);
+    return { identity: null, error: null, code: "verified_no_identifier" };
   }
   return { identity, error: null };
 }
@@ -541,6 +616,7 @@ Deno.serve(async (req) => {
       accessToken?: unknown;
       reqId?: unknown;
       otp?: unknown;
+      otpBind?: unknown;
       registrationToken?: unknown;
       phone?: unknown;
       email?: unknown;
@@ -564,7 +640,10 @@ Deno.serve(async (req) => {
       const retryId = typeof input?.reqId === "string" ? input.reqId.trim() : "";
       if (/^[A-Za-z0-9_-]{8,128}$/.test(retryId)) {
         const retried = await msg91Widget("/retryOtp", { reqId: retryId });
-        if (isMsg91Success(retried)) return response({ success: true, reqId: retryId });
+        if (isMsg91Success(retried)) {
+          const otpBind = await signOtpBind(retryId, { phone, email });
+          return response({ success: true, reqId: retryId, otpBind });
+        }
       }
       const body = await msg91Widget("/sendOtp", { identifier });
       if (!isMsg91Success(body)) {
@@ -574,7 +653,8 @@ Deno.serve(async (req) => {
       }
       const reqId = requestIdFrom(body);
       if (!reqId) return response({ success: false, error: "MSG91 did not return a request id." }, 502);
-      return response({ success: true, reqId });
+      const otpBind = await signOtpBind(reqId, { phone, email });
+      return response({ success: true, reqId, otpBind });
     }
     // Frontend flags are ignored. Existence is decided only after MSG91 verification.
     void input?.isNewUser;
@@ -777,15 +857,35 @@ Deno.serve(async (req) => {
     let identity: VerifiedIdentity | null = null;
     if (/^[A-Za-z0-9_-]{8,128}$/.test(reqId) && /^\d{4,8}$/.test(otp)) {
       const verified = await verifyOtpWithMsg91(reqId, otp);
-      if (!verified.identity) {
+      const recoverFromBind = verified.code === "already_verified" || verified.code === "verified_no_identifier";
+      if (recoverFromBind) {
+        const otpBind = typeof input?.otpBind === "string" ? input.otpBind.trim() : "";
+        const bound = await readOtpBind(otpBind);
+        const claimedEmail = typeof input?.email === "string" ? canonicalEmail(input.email) : null;
+        const claimedPhone = typeof input?.phone === "string" ? canonicalPhone(input.phone) : null;
+        const sameRequest = Boolean(
+          bound &&
+          bound.reqId === reqId &&
+          ((bound.email && bound.email === claimedEmail) || (bound.phone && bound.phone === claimedPhone)),
+        );
+        if (!sameRequest || !bound) {
+          return response({
+            success: false,
+            error: "This OTP has expired. Please request a new OTP.",
+            code: "otp_expired",
+          }, 401);
+        }
+        identity = { phone: bound.phone, email: bound.email };
+      } else if (!verified.identity) {
         const status = verified.code === "missing_authkey" ? 503 : verified.code === "ip_blocked" ? 403 : 401;
         return response({
           success: false,
           error: verified.error ?? "MSG91 could not verify the code.",
           code: verified.code ?? "otp_rejected",
         }, status);
+      } else {
+        identity = verified.identity;
       }
-      identity = verified.identity;
     } else if (accessToken.split(".").length === 3 && accessToken.length <= 8192) {
       identity = await verifyAccessToken(accessToken);
       if (!identity) return response({ success: false, error: "Verification failed. Please request a new code." }, 401);
