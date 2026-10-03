@@ -1,4 +1,4 @@
-﻿import {
+import {
   createContext,
   useCallback,
   useContext,
@@ -201,6 +201,23 @@ const OPENAI_TRANSCRIBE_EXTENSIONS = new Set([
 ]);
 
 const MIN_VOICE_DURATION_SEC = 0.6;
+/** dBFS at or above this counts as speech. Opening quiet does not. */
+const VOICE_SPEECH_DB = -32;
+/** dBFS below this, after speech, counts as a pause. */
+const VOICE_SILENCE_DB = -45;
+const VOICE_SILENCE_MS = 800;
+const VOICE_SPEECH_HOLD_MS = 280;
+
+let voiceAutoStopListener: (() => void) | null = null;
+
+/** Voice mode registers this so a pause can finish the turn without a tap. */
+export function setVoiceAutoStopListener(listener: (() => void) | null) {
+  voiceAutoStopListener = listener;
+}
+
+function notifyVoiceAutoStop() {
+  voiceAutoStopListener?.();
+}
 const ANDROID_VOICE_FILE_EXTENSION = "mp4";
 const ANDROID_VOICE_MIME_TYPE = "audio/mp4";
 
@@ -211,6 +228,7 @@ const ASK_PRANA_VOICE_RECORDING_OPTIONS: RecordingOptions = {
   sampleRate: 44100,
   numberOfChannels: 1,
   bitRate: 128000,
+  isMeteringEnabled: true,
   android: {
     ...RecordingPresets.HIGH_QUALITY.android,
     extension: ".mp4",
@@ -726,6 +744,7 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
   const recordingGuardUntilRef = useRef(0);
   /** Earliest time Stop is allowed (avoids start+stop double-tap). */
   const recordingStopAllowedAtRef = useRef(0);
+  const voiceSilenceWatchRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const selectedPondIdForDictationRef = useRef<string | null>(null);
   const webDictationRef = useRef<WebDictationSession | null>(null);
   const webDictationBaseDraftRef = useRef("");
@@ -789,6 +808,47 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
     audioRecorderRef.current = audioRecorder;
   }, [audioRecorder]);
 
+  const clearVoiceSilenceWatch = useCallback(() => {
+    if (voiceSilenceWatchRef.current) {
+      clearInterval(voiceSilenceWatchRef.current);
+      voiceSilenceWatchRef.current = null;
+    }
+  }, []);
+
+  const startVoiceSilenceWatch = useCallback(() => {
+    clearVoiceSilenceWatch();
+    let speechStartedAt = 0;
+    let silenceStartedAt = 0;
+    let armed = false;
+    voiceSilenceWatchRef.current = setInterval(() => {
+      if (webDictationSourceRef.current !== "voice" || !isRecordingRef.current) {
+        return;
+      }
+      const level = audioRecorderRef.current?.getStatus()?.metering;
+      if (typeof level !== "number") return;
+      const now = Date.now();
+      if (level >= VOICE_SPEECH_DB) {
+        if (!speechStartedAt) speechStartedAt = now;
+        silenceStartedAt = 0;
+        if (now - speechStartedAt >= VOICE_SPEECH_HOLD_MS) armed = true;
+        return;
+      }
+      speechStartedAt = 0;
+      if (!armed || level > VOICE_SILENCE_DB) {
+        silenceStartedAt = 0;
+        return;
+      }
+      if (!silenceStartedAt) silenceStartedAt = now;
+      if (
+        now - silenceStartedAt >= VOICE_SILENCE_MS &&
+        now >= recordingStopAllowedAtRef.current
+      ) {
+        clearVoiceSilenceWatch();
+        notifyVoiceAutoStop();
+      }
+    }, 120);
+  }, [clearVoiceSilenceWatch]);
+
   const releaseRecordingResources = useCallback(async () => {
     const recorder = audioRecorderRef.current;
     try {
@@ -809,6 +869,7 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const cancelAudioRecording = useCallback(async () => {
+    clearVoiceSilenceWatch();
     dictationEpochRef.current += 1;
     voiceStopInFlightRef.current = false;
     recordingGuardUntilRef.current = 0;
@@ -846,7 +907,7 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
     }
     await releaseRecordingResources();
     console.log("[AskPranaChat] dictation cancelled; draft preserved");
-  }, [releaseRecordingResources]);
+  }, [clearVoiceSilenceWatch, releaseRecordingResources]);
 
   const clearStuckRecordingFlag = useCallback(() => {
     if (webDictationRef.current) {
@@ -863,9 +924,10 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     return () => {
+      clearVoiceSilenceWatch();
       void releaseRecordingResources();
     };
-  }, [releaseRecordingResources]);
+  }, [clearVoiceSilenceWatch, releaseRecordingResources]);
 
   useEffect(() => {
     const previous = selectedPondIdForDictationRef.current;
@@ -2396,6 +2458,12 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
           onError: (message) => {
             Alert.alert("Dictation", message);
           },
+          onUtteranceEnd:
+            source === "voice"
+              ? () => {
+                  notifyVoiceAutoStop();
+                }
+              : undefined,
         });
         webDictationRef.current = session;
         isRecordingRef.current = true;
@@ -2448,6 +2516,9 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
       recordingStopAllowedAtRef.current = Date.now() + 700;
       recordingGuardUntilRef.current = Date.now() + 2500;
       voiceBusyRef.current = false;
+      if (source === "voice") {
+        startVoiceSilenceWatch();
+      }
       console.log("[AskPranaChat] recording started");
     } catch (error) {
       console.log("[AskPranaChat] start recording failed:", error);
@@ -2467,9 +2538,10 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
         throw error instanceof Error ? error : new Error("VOICE_PERMISSION");
       }
     }
-  }, [audioRecorder, clearStuckRecordingFlag, releaseRecordingResources]);
+  }, [audioRecorder, clearStuckRecordingFlag, releaseRecordingResources, startVoiceSilenceWatch]);
 
   const finishWebDictation = useCallback(async (): Promise<string | null> => {
+    clearVoiceSilenceWatch();
     const session = webDictationRef.current;
     if (!session) {
       return null;
@@ -2494,8 +2566,8 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
       if (!transcript) {
         if (webDictationSourceRef.current === "composer") {
           setDraft(webDictationBaseDraftRef.current);
+          Alert.alert("Couldn't understand", voiceErrorMessage("VOICE_EMPTY"));
         }
-        Alert.alert("Couldn't understand", voiceErrorMessage("VOICE_EMPTY"));
         return null;
       }
 
@@ -2518,9 +2590,10 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
       setIsTranscribing(false);
       recordingStopAllowedAtRef.current = 0;
     }
-  }, []);
+  }, [clearVoiceSilenceWatch]);
 
   const captureRecordingTranscript = useCallback(async (): Promise<string | null> => {
+    clearVoiceSilenceWatch();
     if (voiceStopInFlightRef.current) {
       console.log("[AskPranaChat] stop skipped: already stopping");
       return null;
@@ -2661,7 +2734,9 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
       }
 
       if (!transcript.trim()) {
-        Alert.alert("Couldn't understand", voiceErrorMessage("VOICE_EMPTY"));
+        if (webDictationSourceRef.current !== "voice") {
+          Alert.alert("Couldn't understand", voiceErrorMessage("VOICE_EMPTY"));
+        }
         return null;
       }
 
@@ -2681,7 +2756,7 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
       setIsRecording(false);
       await releaseRecordingResources();
     }
-  }, [audioRecorder, clearStuckRecordingFlag, releaseRecordingResources]);
+  }, [audioRecorder, clearStuckRecordingFlag, clearVoiceSilenceWatch, releaseRecordingResources]);
 
   const stopAudioRecordingToTranscript = useCallback(async () => {
     if (webDictationRef.current) {

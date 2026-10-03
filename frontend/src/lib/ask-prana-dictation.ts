@@ -15,6 +15,7 @@ type SpeechRecognitionLike = {
   onresult: ((event: SpeechRecognitionEventLike) => void) | null;
   onerror: ((event: { error?: string }) => void) | null;
   onend: (() => void) | null;
+  onspeechend: (() => void) | null;
 };
 
 type SpeechRecognitionEventLike = {
@@ -30,7 +31,12 @@ type SpeechRecognitionCtor = new () => SpeechRecognitionLike;
 export type WebDictationHandlers = {
   onPartial: (text: string) => void;
   onError: (message: string) => void;
+  /** Fires once after the user has spoken and then paused. Composer dictation omits this. */
+  onUtteranceEnd?: (text: string) => void;
 };
+
+/** Pause after real speech before a voice-mode turn sends itself. */
+const UTTERANCE_PAUSE_MS = 800;
 
 export type WebDictationSession = {
   stop: () => Promise<string>;
@@ -113,7 +119,30 @@ export function startWebDictation(
   let interimText = "";
   let settled = false;
   let stopRequested = false;
+  let utteranceSent = false;
+  let pauseTimer: ReturnType<typeof setTimeout> | null = null;
   let resolveStop: ((value: string) => void) | null = null;
+
+  const clearPause = () => {
+    if (pauseTimer) {
+      clearTimeout(pauseTimer);
+      pauseTimer = null;
+    }
+  };
+
+  const armUtterancePause = () => {
+    if (!handlers.onUtteranceEnd || utteranceSent || stopRequested || settled) return;
+    if (!currentTranscript().trim()) return;
+    clearPause();
+    pauseTimer = setTimeout(() => {
+      pauseTimer = null;
+      if (utteranceSent || stopRequested || settled) return;
+      const text = currentTranscript().trim();
+      if (!text) return;
+      utteranceSent = true;
+      handlers.onUtteranceEnd?.(text);
+    }, UTTERANCE_PAUSE_MS);
+  };
 
   const currentTranscript = () => {
     const spoken = mergeTranscript(committedText, sessionFinal);
@@ -137,6 +166,11 @@ export function startWebDictation(
     sessionFinal = finals;
     interimText = interim;
     emitPartial();
+    armUtterancePause();
+  };
+
+  recognition.onspeechend = () => {
+    armUtterancePause();
   };
 
   recognition.onerror = (event) => {
@@ -190,6 +224,7 @@ export function startWebDictation(
           return;
         }
         stopRequested = true;
+        clearPause();
         resolveStop = resolve;
         try {
           recognition.stop();
@@ -212,6 +247,7 @@ export function startWebDictation(
       }),
     cancel: () => {
       stopRequested = true;
+      clearPause();
       settled = true;
       resolveStop?.("");
       resolveStop = null;

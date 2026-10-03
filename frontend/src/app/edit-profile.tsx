@@ -490,20 +490,23 @@ export default function EditProfileScreen() {
         )}
       </ScrollView>
       <Modal visible={logoutConfirmOpen} transparent animationType="fade" onRequestClose={() => !loggingOut && setLogoutConfirmOpen(false)}>
-        <View style={styles.dialogBackdrop}>
-          <View style={styles.dialog}>
-            <Text style={styles.dialogTitle}>{t("profile.logoutConfirmTitle")}</Text>
-            <Text style={styles.dialogBody}>{t("profile.logoutConfirmBody")}</Text>
-            {logoutError ? <Text style={styles.dialogError}>{logoutError}</Text> : null}
-            <View style={styles.dialogActions}>
-              <Pressable onPress={() => setLogoutConfirmOpen(false)} disabled={loggingOut} style={styles.dialogCancel} accessibilityRole="button">
-                <Text style={styles.dialogCancelText}>{t("common.cancel")}</Text>
-              </Pressable>
-              <Pressable onPress={() => void confirmLogout()} disabled={loggingOut} style={[styles.dialogLogout, loggingOut && styles.saveButtonDisabled]} accessibilityRole="button">
-                {loggingOut ? <ActivityIndicator color={colors.text} /> : <Text style={styles.saveText}>{t("profile.logout")}</Text>}
-              </Pressable>
+        <View style={styles.logoutScreen}>
+          <Text style={styles.logoutTitle}>Log out of Ask Prana?</Text>
+          <View style={styles.logoutAccount}>
+            <UserAvatar name={name} avatarUrl={avatarUrl} avatarUpdatedAt={avatarUpdatedAt} size={36} variant="solid" />
+            <View style={styles.logoutAccountCopy}>
+              <Text style={styles.logoutName} numberOfLines={1}>{name || "Ask Prana"}</Text>
+              <Text style={styles.logoutEmail} numberOfLines={1}>{email || phone}</Text>
             </View>
           </View>
+          <Text style={styles.logoutHint}>You'll need to log in again to access your chats.</Text>
+          {logoutError ? <Text style={styles.dialogError}>{logoutError}</Text> : null}
+          <Pressable onPress={() => void confirmLogout()} disabled={loggingOut} style={[styles.logoutConfirm, loggingOut && styles.saveButtonDisabled]} accessibilityRole="button">
+            {loggingOut ? <ActivityIndicator color="#171717" /> : <Text style={styles.logoutConfirmText}>Log out</Text>}
+          </Pressable>
+          <Pressable onPress={() => setLogoutConfirmOpen(false)} disabled={loggingOut} style={styles.logoutCancel} accessibilityRole="button">
+            <Text style={styles.logoutCancelText}>Cancel</Text>
+          </Pressable>
         </View>
       </Modal>
     </SafeAreaView>
@@ -545,13 +548,16 @@ const styles = StyleSheet.create({
   logoutButtonHovered: { borderColor: colors.danger },
   logoutButtonPressed: { opacity: 0.7 },
   logoutText: { color: colors.danger, fontSize: 14, lineHeight: 20, fontWeight: "600" },
-  dialogBackdrop: { flex: 1, justifyContent: "center", paddingHorizontal: 24, backgroundColor: "rgba(0,0,0,0.65)" },
-  dialog: { width: "100%", maxWidth: 420, alignSelf: "center", padding: 20, gap: 14, borderRadius: 10, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.card },
-  dialogTitle: { color: colors.text, fontSize: 17, lineHeight: 22, fontWeight: "600" },
-  dialogBody: { color: colors.muted, fontSize: 14, lineHeight: 21, fontWeight: "400" },
-  dialogError: { color: colors.danger, fontSize: 13, lineHeight: 19, fontWeight: "500" },
-  dialogActions: { flexDirection: "row", justifyContent: "flex-end", gap: 8 },
-  dialogCancel: { minHeight: 38, justifyContent: "center", paddingHorizontal: 12 },
-  dialogCancelText: { color: colors.text, fontSize: 13, lineHeight: 18, fontWeight: "500" },
-  dialogLogout: { minHeight: 38, minWidth: 88, justifyContent: "center", alignItems: "center", paddingHorizontal: 14, borderRadius: 6, backgroundColor: "#B94444" },
+  dialogError: { color: colors.danger, fontSize: 13, lineHeight: 19, fontWeight: "500", textAlign: "center" },
+  logoutScreen: { flex: 1, backgroundColor: "#000000", alignItems: "center", justifyContent: "center", paddingHorizontal: 24, gap: 16 },
+  logoutTitle: { color: "#FFFFFF", fontSize: 28, lineHeight: 34, fontWeight: "600", textAlign: "center", marginBottom: 8 },
+  logoutAccount: { width: "100%", maxWidth: 360, minHeight: 64, borderRadius: 16, borderWidth: 1, borderColor: "#3A3A3A", paddingHorizontal: 14, flexDirection: "row", alignItems: "center", gap: 12 },
+  logoutAccountCopy: { flex: 1, minWidth: 0 },
+  logoutName: { color: "#FFFFFF", fontSize: 15, lineHeight: 20, fontWeight: "600" },
+  logoutEmail: { color: "#A3A3A3", fontSize: 13, lineHeight: 18 },
+  logoutHint: { color: "#D4D4D4", fontSize: 14, lineHeight: 20, textAlign: "center" },
+  logoutConfirm: { width: "100%", maxWidth: 360, minHeight: 48, borderRadius: 24, backgroundColor: "#FFFFFF", alignItems: "center", justifyContent: "center" },
+  logoutConfirmText: { color: "#171717", fontSize: 16, lineHeight: 22, fontWeight: "600" },
+  logoutCancel: { width: "100%", maxWidth: 360, minHeight: 48, borderRadius: 24, borderWidth: 1, borderColor: "#5A5A5A", alignItems: "center", justifyContent: "center" },
+  logoutCancelText: { color: "#FFFFFF", fontSize: 16, lineHeight: 22, fontWeight: "500" },
 });

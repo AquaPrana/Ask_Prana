@@ -460,3 +460,9 @@ entrypoint = "./functions/auth-send-email/index.ts"
 enabled = true
 verify_jwt = false
 entrypoint = "./functions/msg91-auth/index.ts"
+
+# Google account chooser. The public client id stays in the GOOGLE_WEB_CLIENT_ID secret.
+[functions.google-auth]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/google-auth/index.ts"

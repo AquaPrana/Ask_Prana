@@ -1631,7 +1631,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     paddingHorizontal: 14,
     borderRadius: 8,
-    backgroundColor: colors.primary,
+    backgroundColor: "#0F766E",
   },
   userEditSendButtonDisabled: {
     opacity: 0.45,

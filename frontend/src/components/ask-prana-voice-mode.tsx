@@ -1,10 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ActivityIndicator,
   Alert,
-  Modal,
   Pressable,
-  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -13,7 +10,6 @@ import {
 import Feather from "@expo/vector-icons/Feather";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { ASK_PRANA_FONT_FAMILY } from "../constants/ask-prana-typography";
-import { AskPranaLogo } from "./ask-prana-logo";
 import type { AskPranaRequestContext } from "../services/ask-prana";
 import {
   ASK_PRANA_LANGUAGE_OPTIONS,
@@ -24,6 +20,7 @@ import {
   speakAskPranaText,
   stopAskPranaSpeech,
 } from "../lib/ask-prana-speech";
+import { setVoiceAutoStopListener } from "../context/ask-prana-chat-context";
 
 const colors = {
   primary: "#0F766E",
@@ -54,8 +51,15 @@ type TranscriptLine = {
   text: string;
 };
 
+type VoiceBarActions = {
+  toggleMute: () => void;
+  end: () => void;
+  submitTyped: () => void;
+};
+
 type Props = {
   visible: boolean;
+  variant: "overlay" | "screen";
   language: AskPranaSpeechLanguageCode;
   requestContext: AskPranaRequestContext;
   isRecording: boolean;
@@ -72,7 +76,86 @@ type Props = {
     context: AskPranaRequestContext,
   ) => Promise<{ answer: string; language: AskPranaSpeechLanguageCode } | null>;
   onLanguageChange: (code: AskPranaSpeechLanguageCode) => Promise<void>;
+  onOpenMenu?: () => void;
+  onAddImage?: () => void;
+  onAddFile?: () => void;
+  addImageLabel?: string;
+  addFileLabel?: string;
+  onMutedChange?: (muted: boolean) => void;
+  onRegisterActions?: (actions: VoiceBarActions | null) => void;
 };
+
+function mixHex(from: string, to: string, amount: number) {
+  const read = (hex: string) => [
+    Number.parseInt(hex.slice(1, 3), 16),
+    Number.parseInt(hex.slice(3, 5), 16),
+    Number.parseInt(hex.slice(5, 7), 16),
+  ];
+  const start = read(from);
+  const end = read(to);
+  const channel = start.map((value, index) =>
+    Math.round(value + (end[index] - value) * amount),
+  );
+  return `rgb(${channel[0]}, ${channel[1]}, ${channel[2]})`;
+}
+
+function VoiceSkyOrb({ size, scale }: { size: number; scale: number }) {
+  const bands = 40;
+  return (
+    <View
+      style={{
+        width: size,
+        height: size,
+        borderRadius: size / 2,
+        overflow: "hidden",
+        transform: [{ scale }],
+        backgroundColor: "#0F766E",
+      }}
+    >
+      {Array.from({ length: bands }, (_, index) => {
+        const t = index / (bands - 1);
+        const color = t < 0.42
+          ? mixHex("#0F766E", "#5EEAD4", t / 0.42)
+          : mixHex("#5EEAD4", "#FFFFFF", (t - 0.42) / 0.58);
+        return (
+          <View
+            key={index}
+            style={{
+              position: "absolute",
+              left: 0,
+              right: 0,
+              top: (size / bands) * index,
+              height: size / bands + 1,
+              backgroundColor: color,
+            }}
+          />
+        );
+      })}
+      <View
+        style={{
+          position: "absolute",
+          left: size * 0.08,
+          width: size * 0.7,
+          bottom: size * 0.08,
+          height: size * 0.34,
+          borderRadius: size,
+          backgroundColor: "rgba(255,255,255,0.55)",
+        }}
+      />
+      <View
+        style={{
+          position: "absolute",
+          right: size * 0.06,
+          width: size * 0.42,
+          bottom: size * 0.2,
+          height: size * 0.22,
+          borderRadius: size,
+          backgroundColor: "rgba(255,255,255,0.4)",
+        }}
+      />
+    </View>
+  );
+}
 
 function voiceTurnErrorMessage(error: unknown) {
   if (error instanceof Error && error.message.trim()) {
@@ -86,6 +169,7 @@ function voiceTurnErrorMessage(error: unknown) {
 
 export function AskPranaVoiceModeModal({
   visible,
+  variant,
   language,
   requestContext,
   isRecording,
@@ -99,6 +183,13 @@ export function AskPranaVoiceModeModal({
   onStopListeningToTranscript,
   onAsk,
   onLanguageChange,
+  onOpenMenu,
+  onAddImage,
+  onAddFile,
+  addImageLabel = "Add image",
+  addFileLabel = "Add file",
+  onMutedChange,
+  onRegisterActions,
 }: Props) {
   const insets = useSafeAreaInsets();
   const [state, setState] = useState<VoiceModeState>("idle");
@@ -108,6 +199,7 @@ export function AskPranaVoiceModeModal({
   const [lines, setLines] = useState<TranscriptLine[]>([]);
   const [pulse, setPulse] = useState(0);
   const [languageMenuOpen, setLanguageMenuOpen] = useState(false);
+  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [activeLanguage, setActiveLanguage] =
     useState<AskPranaSpeechLanguageCode>(language);
   const loopArmedRef = useRef(false);
@@ -115,7 +207,6 @@ export function AskPranaVoiceModeModal({
   const stateRef = useRef<VoiceModeState>("idle");
   const isRecordingRef = useRef(false);
   const orbPressLockRef = useRef(false);
-  const languageLabel = getAskPranaLanguageOption(activeLanguage).nativeLabel;
 
   useEffect(() => {
     stateRef.current = state;
@@ -290,6 +381,7 @@ export function AskPranaVoiceModeModal({
 
   const finishListeningTurn = useCallback(async () => {
     if (!sessionActiveRef.current || mutedRef.current) return;
+    if (stateRef.current === "processing" || stateRef.current === "speaking") return;
     // Immediate UI feedback — do not wait on React isRecording (can be stale).
     setState("processing");
     stateRef.current = "processing";
@@ -297,12 +389,13 @@ export function AskPranaVoiceModeModal({
     try {
       // Always attempt stop; capture path no-ops if mic is not live.
       const transcript = await onStopListeningToTranscript();
-      if (!sessionActiveRef.current) return;
+      if (!sessionActiveRef.current || mutedRef.current) return;
       if (!transcript?.trim()) {
-        console.log("[AskPranaVoice] empty transcript after stop — idle");
-        setState("idle");
-        stateRef.current = "idle";
-        setErrorText("No speech captured. Tap the orb to speak again.");
+        console.log("[AskPranaVoice] empty transcript — keep listening");
+        setErrorText(null);
+        setState("listening");
+        stateRef.current = "listening";
+        await onStartListening();
         return;
       }
       await runTurnFromTranscript(transcript.trim());
@@ -315,7 +408,20 @@ export function AskPranaVoiceModeModal({
       // reply had failed, making both mic entry points look broken.
       setErrorText(voiceTurnErrorMessage(error));
     }
-  }, [onStopListeningToTranscript, runTurnFromTranscript]);
+  }, [onStartListening, onStopListeningToTranscript, runTurnFromTranscript]);
+
+  useEffect(() => {
+    if (!visible) {
+      setVoiceAutoStopListener(null);
+      return;
+    }
+    setVoiceAutoStopListener(() => {
+      if (!sessionActiveRef.current || mutedRef.current) return;
+      if (stateRef.current !== "listening") return;
+      void finishListeningTurn();
+    });
+    return () => setVoiceAutoStopListener(null);
+  }, [visible, finishListeningTurn]);
 
   const handleOrbPress = useCallback(async () => {
     if (!sessionActiveRef.current || orbPressLockRef.current) return;
@@ -411,54 +517,91 @@ export function AskPranaVoiceModeModal({
     if (!text || isSending || isTranscribing) return;
     onChangeDraft("");
     await stopAskPranaSpeech();
+    await onCancelListening();
     await runTurnFromTranscript(text);
   }, [
     draft,
     isSending,
     isTranscribing,
+    onCancelListening,
     onChangeDraft,
     runTurnFromTranscript,
   ]);
 
+  useEffect(() => {
+    onMutedChange?.(muted);
+  }, [muted, onMutedChange]);
+
+  useEffect(() => {
+    if (!visible || variant !== "overlay") {
+      onRegisterActions?.(null);
+      return;
+    }
+    onRegisterActions?.({
+      toggleMute: () => {
+        void handleMuteToggle();
+      },
+      end: () => {
+        void handleEnd();
+      },
+      submitTyped: () => {
+        void handleSendTyped();
+      },
+    });
+    return () => onRegisterActions?.(null);
+  }, [visible, variant, handleMuteToggle, handleEnd, handleSendTyped, onRegisterActions]);
+
   const statusLabel = (() => {
-    if (state === "listening") return "Listening… tap orb to stop";
-    if (state === "processing" || isTranscribing || isSending)
-      return "Processing…";
-    if (state === "speaking") return "Speaking… tap orb to interrupt";
+    if (state === "listening") return "";
+    if (state === "processing" || isTranscribing || isSending) return "";
+    if (state === "speaking") return "";
     if (state === "muted") return "Muted";
     if (state === "reconnecting") return "Reconnecting…";
     if (state === "error") return errorText || "Something went wrong";
-    if (state === "idle") return "Tap orb to start listening";
-    return "Tap orb to start listening";
+    return "";
   })();
+  const orbScale = state === "speaking" ? 1.06 + pulse * 0.03 : state === "listening" ? 1 + pulse * 0.025 : 1;
+  const orb = (
+    <Pressable
+      onPress={() => {
+        void handleOrbPress();
+      }}
+      accessibilityRole="button"
+      accessibilityLabel="Voice conversation"
+    >
+      <VoiceSkyOrb size={variant === "overlay" ? 88 : 200} scale={orbScale} />
+    </Pressable>
+  );
+
+  if (!visible) return null;
+
+  if (variant === "overlay") {
+    return (
+      <View pointerEvents="box-none" style={styles.overlayHost}>
+        {orb}
+        {errorText ? <Text style={styles.errorHint}>{errorText}</Text> : null}
+      </View>
+    );
+  }
 
   return (
-    <Modal
-      visible={visible}
-      animationType="slide"
-      onRequestClose={() => {
-        void handleEnd();
-      }}
-    >
-      <View style={[styles.root, { paddingTop: insets.top + 12, paddingBottom: insets.bottom + 12 }]}>
+    <View style={[styles.root, { paddingTop: insets.top + 12, paddingBottom: insets.bottom + 16 }]}>
         <View style={styles.header}>
-          <View style={styles.headerBrand}>
-            <AskPranaLogo size={36} decorative />
-            <View>
-            <Text style={styles.title}>Ask Prana Voice</Text>
-            <Pressable
-              onPress={() => setLanguageMenuOpen((open) => !open)}
-              style={styles.languagePicker}
-              accessibilityRole="button"
-              accessibilityLabel="Change voice language"
-            >
-              <Text style={styles.subtitle}>{languageLabel}</Text>
-              <Feather name="chevron-down" size={14} color={colors.muted} />
-            </Pressable>
-            </View>
-          </View>
-          <Pressable onPress={() => void handleEnd()} style={styles.iconBtn} accessibilityLabel="End voice">
-            <Feather name="x" size={20} color={colors.white} />
+          <Pressable
+            onPress={onOpenMenu}
+            style={styles.roundBtn}
+            accessibilityRole="button"
+            accessibilityLabel="Open menu"
+          >
+            <Feather name="menu" size={18} color={colors.white} />
+          </Pressable>
+          <Pressable
+            onPress={() => setLanguageMenuOpen((open) => !open)}
+            style={styles.roundBtn}
+            accessibilityRole="button"
+            accessibilityLabel="Change voice language"
+          >
+            <Feather name="sliders" size={16} color={colors.white} />
           </Pressable>
         </View>
 
@@ -479,113 +622,104 @@ export function AskPranaVoiceModeModal({
           </View>
         ) : null}
 
-        <ScrollView style={styles.transcript} contentContainerStyle={styles.transcriptContent}>
-          {lines.length === 0 ? (
-            <Text style={styles.empty}>
-              Speak naturally. Transcripts appear here. You can also type below.
-            </Text>
-          ) : (
-            lines.map((line) => (
-              <View
-                key={line.id}
-                style={[
-                  styles.line,
-                  line.role === "user" ? styles.lineUser : styles.lineAssistant,
-                ]}
-              >
-                <Text style={styles.lineText}>{line.text}</Text>
-              </View>
-            ))
-          )}
-        </ScrollView>
-
-        <View style={styles.orbWrap}>
-          <Pressable
-            onPress={() => {
-              void handleOrbPress();
-            }}
-            style={[
-              styles.orbOuter,
-              (state === "listening" || state === "speaking") && {
-                transform: [{ scale: 1 + pulse * 0.04 }],
-                shadowOpacity: 0.35 + pulse * 0.1,
-              },
-            ]}
-            accessibilityRole="button"
-            accessibilityLabel="Voice orb"
-          >
-            <View style={styles.orbInner}>
-              {state === "processing" || isTranscribing || isSending ? (
-                <ActivityIndicator color={colors.white} />
-              ) : (
-                <Feather
-                  name={state === "muted" ? "mic-off" : state === "speaking" ? "volume-2" : "mic"}
-                  size={36}
-                  color={colors.white}
-                />
-              )}
-            </View>
-          </Pressable>
-          <Text style={styles.status}>{statusLabel}</Text>
+        <View style={styles.stage}>
+          {orb}
+          {statusLabel ? <Text style={styles.status}>{statusLabel}</Text> : null}
           {errorText && state !== "error" ? (
             <Text style={styles.errorHint}>{errorText}</Text>
           ) : null}
         </View>
 
-        <View style={styles.composerRow}>
-          <TextInput
-            value={draft}
-            onChangeText={onChangeDraft}
-            placeholder="Type while in voice mode"
-            placeholderTextColor={colors.muted}
-            style={styles.input}
-            editable={!isSending && !isTranscribing}
-          />
-          <Pressable
-            onPress={() => {
-              void handleSendTyped();
-            }}
-            style={styles.sendBtn}
-            disabled={!draft.trim() || isSending}
-          >
-            <Feather name="send" size={16} color={colors.white} />
-          </Pressable>
-        </View>
-
-        <View style={styles.controls}>
-          <Pressable onPress={() => void handleMuteToggle()} style={styles.controlBtn}>
-            <Feather
-              name={muted ? "mic-off" : "mic"}
-              size={18}
-              color={colors.white}
+        <View style={styles.bottomBar}>
+          <View style={styles.composerPill}>
+            <Pressable
+              onPress={() => setAttachMenuOpen((open) => !open)}
+              style={styles.plusBtn}
+              accessibilityRole="button"
+              accessibilityLabel="Add"
+            >
+              <Feather name="plus" size={20} color="#E5E5E5" />
+            </Pressable>
+            {attachMenuOpen ? (
+              <View style={styles.attachMenu}>
+                <Pressable
+                  onPress={() => {
+                    setAttachMenuOpen(false);
+                    onAddImage?.();
+                  }}
+                  style={styles.attachItem}
+                >
+                  <Text style={styles.attachItemText}>{addImageLabel}</Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => {
+                    setAttachMenuOpen(false);
+                    onAddFile?.();
+                  }}
+                  style={styles.attachItem}
+                >
+                  <Text style={styles.attachItemText}>{addFileLabel}</Text>
+                </Pressable>
+              </View>
+            ) : null}
+            <TextInput
+              value={draft}
+              onChangeText={onChangeDraft}
+              placeholder="Ask Prana"
+              placeholderTextColor="#A3A3A3"
+              style={styles.input}
+              editable={!isSending && !isTranscribing}
+              onSubmitEditing={() => {
+                void handleSendTyped();
+              }}
             />
-            <Text style={styles.controlText}>{muted ? "Unmute" : "Mute"}</Text>
+          </View>
+          <Pressable
+            onPress={() => void handleMuteToggle()}
+            style={styles.roundBtn}
+            accessibilityRole="button"
+            accessibilityLabel={muted ? "Unmute" : "Mute"}
+          >
+            <Feather name={muted ? "mic" : "mic-off"} size={18} color={colors.white} />
           </Pressable>
-          <Pressable onPress={() => void handleEnd()} style={[styles.controlBtn, styles.endBtn]}>
-            <Feather name="x-circle" size={18} color={colors.white} />
-            <Text style={styles.controlText}>End</Text>
+          <Pressable
+            onPress={() => void handleEnd()}
+            style={[styles.roundBtn, styles.closeBtn]}
+            accessibilityRole="button"
+            accessibilityLabel="End"
+          >
+            <Feather name="x" size={20} color="#111111" />
           </Pressable>
         </View>
-      </View>
-    </Modal>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   root: {
     flex: 1,
-    backgroundColor: colors.background,
+    height: "100%",
+    backgroundColor: "#000000",
     paddingHorizontal: 16,
-    gap: 12,
+  },
+  overlayHost: {
+    position: "absolute",
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    alignItems: "center",
+    justifyContent: "flex-end",
+    paddingBottom: 28,
+    zIndex: 5,
   },
   header: {
+    minHeight: 44,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
   },
-  headerBrand: { flexDirection: "row", alignItems: "center", gap: 10 },
-  title: { color: colors.white, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 18, lineHeight: 23, fontWeight: "600" },
-  subtitle: { color: colors.muted, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 13, lineHeight: 18, marginTop: 2, fontWeight: "500" },
+  subtitle: { color: colors.muted, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 14, lineHeight: 18, fontWeight: "500" },
   languagePicker: { flexDirection: "row", alignItems: "center", gap: 2 },
   languageMenu: { flexDirection: "row", gap: 8 },
   languageOption: {
@@ -597,106 +731,129 @@ const styles = StyleSheet.create({
   },
   languageOptionActive: { backgroundColor: colors.primary, borderColor: colors.primary },
   languageOptionText: { color: colors.text, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 12, lineHeight: 16, fontWeight: "500" },
-  iconBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+  stage: {
+    flex: 1,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: colors.card,
+    gap: 28,
   },
-  transcript: { flex: 1 },
-  transcriptContent: { gap: 10, paddingVertical: 8 },
-  empty: { color: colors.muted, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 14, lineHeight: 21, fontWeight: "400" },
-  line: {
-    borderRadius: 14,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    maxWidth: "92%",
+  caption: {
+    color: "#D4D4D4",
+    fontFamily: ASK_PRANA_FONT_FAMILY,
+    fontSize: 16,
+    lineHeight: 24,
+    textAlign: "center",
+    paddingHorizontal: 24,
+    maxWidth: 560,
   },
-  lineUser: {
-    alignSelf: "flex-end",
-    backgroundColor: colors.primaryDark,
-  },
-  lineAssistant: {
-    alignSelf: "flex-start",
-    backgroundColor: colors.card,
-  },
-  lineText: { color: colors.text, fontFamily: ASK_PRANA_FONT_FAMILY, fontSize: 14, lineHeight: 21, fontWeight: "400" },
-  orbWrap: { alignItems: "center", gap: 10, paddingVertical: 8 },
   orbOuter: {
-    width: 132,
-    height: 132,
-    borderRadius: 66,
-    backgroundColor: colors.orbSoft,
+    width: 280,
+    height: 280,
+    borderRadius: 140,
+    backgroundColor: "rgba(45, 212, 191, 0.18)",
     alignItems: "center",
     justifyContent: "center",
-    shadowColor: colors.orb,
-    shadowOffset: { width: 0, height: 0 },
-    shadowRadius: 24,
-    elevation: 8,
+  },
+  orbMid: {
+    width: 232,
+    height: 232,
+    borderRadius: 116,
+    backgroundColor: "rgba(20, 184, 166, 0.55)",
+    alignItems: "center",
+    justifyContent: "center",
   },
   orbInner: {
-    width: 96,
-    height: 96,
-    borderRadius: 48,
-    backgroundColor: colors.orb,
+    width: 188,
+    height: 188,
+    borderRadius: 94,
+    backgroundColor: "#5EEAD4",
     alignItems: "center",
     justifyContent: "center",
   },
   status: {
     color: colors.text,
     fontFamily: ASK_PRANA_FONT_FAMILY,
-    fontSize: 13,
+    fontSize: 14,
     fontWeight: "500",
     textAlign: "center",
-    paddingHorizontal: 12,
   },
   errorHint: {
     color: colors.danger,
-    fontSize: 12,
+    fontSize: 13,
     textAlign: "center",
     paddingHorizontal: 16,
   },
-  composerRow: {
+  bottomBar: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 8,
+    gap: 10,
+  },
+  composerPill: {
+    flex: 1,
+    minHeight: 52,
+    borderRadius: 26,
+    backgroundColor: "#2F2F2F",
+    flexDirection: "row",
+    alignItems: "center",
+    paddingLeft: 8,
+    paddingRight: 16,
+    position: "relative",
+  },
+  plusBtn: {
+    width: 36,
+    height: 36,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  attachMenu: {
+    position: "absolute",
+    left: 8,
+    bottom: 56,
+    backgroundColor: "#171C23",
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#3A3A3A",
+    paddingVertical: 6,
+    minWidth: 150,
+    zIndex: 8,
+  },
+  attachItem: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  attachItemText: {
+    color: "#F4F7FA",
+    fontFamily: ASK_PRANA_FONT_FAMILY,
+    fontSize: 14,
   },
   input: {
     flex: 1,
     minHeight: 44,
-    borderRadius: 22,
-    backgroundColor: colors.card,
     color: colors.white,
-    paddingHorizontal: 16,
     fontFamily: ASK_PRANA_FONT_FAMILY,
-    fontSize: 14,
-    lineHeight: 21,
+    fontSize: 16,
+    lineHeight: 22,
     fontWeight: "400",
+    outlineStyle: "none",
+    outlineWidth: 0,
   },
   sendBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    backgroundColor: colors.primary,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: "#0F766E",
     alignItems: "center",
     justifyContent: "center",
   },
-  controls: {
-    flexDirection: "row",
-    justifyContent: "center",
-    gap: 12,
-  },
-  controlBtn: {
-    flexDirection: "row",
+  roundBtn: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: "#2F2F2F",
     alignItems: "center",
-    gap: 8,
-    backgroundColor: colors.card,
-    borderRadius: 22,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+    justifyContent: "center",
   },
-  endBtn: { backgroundColor: "#7F1D1D" },
-  controlText: { color: colors.white, fontFamily: ASK_PRANA_FONT_FAMILY, fontWeight: "600", fontSize: 13, lineHeight: 18 },
+  closeBtn: {
+    backgroundColor: "#FFFFFF",
+  },
 });

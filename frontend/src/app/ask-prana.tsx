@@ -496,6 +496,19 @@ export default function AskPranaScreen() {
   }, [attachmentMenuOpen]);
 
   const sidebarVisible = sidebarOpen;
+  const desktopVoice = voiceModeOpen && isDesktop;
+  const voiceActionsRef = useRef<{
+    toggleMute: () => void;
+    end: () => void;
+    submitTyped: () => void;
+  } | null>(null);
+  const registerVoiceActions = useCallback(
+    (actions: { toggleMute: () => void; end: () => void; submitTyped: () => void } | null) => {
+      voiceActionsRef.current = actions;
+    },
+    [],
+  );
+  const [voiceMuted, setVoiceMuted] = useState(false);
   const canSend =
     thinkingVisible ||
     (!isRecording &&
@@ -938,6 +951,7 @@ export default function AskPranaScreen() {
           </View>
 
 
+          <View style={styles.messageColumn}>
           {isLoadingMessages ? (
             <View style={styles.loadingState}>
               <ActivityIndicator size="large" color={colors.primary} />
@@ -991,10 +1005,42 @@ export default function AskPranaScreen() {
               )}
             />
           )}
+          {desktopVoice ? (
+            <AskPranaVoiceModeModal
+              visible={voiceModeOpen}
+              variant="overlay"
+              language={preferredLanguage}
+              requestContext={requestContext}
+              isRecording={isRecording}
+              isTranscribing={isTranscribing}
+              isSending={isSending}
+              draft={draft}
+              onChangeDraft={setDraft}
+              onClose={() => {
+                setVoiceModeOpen(false);
+                setVoiceMuted(false);
+                void stopAskPranaSpeech();
+                void cancelAudioRecording();
+              }}
+              onStartListening={() =>
+                startAudioRecording({ source: "voice", throwOnFailure: true })
+              }
+              onCancelListening={cancelAudioRecording}
+              onStopListeningToTranscript={stopAudioRecordingToTranscript}
+              onAsk={async (question, context) => askFromVoiceMode(question, context)}
+              onLanguageChange={async (code) => {
+                await cancelAudioRecording();
+                await handleSelectLanguage(code);
+              }}
+              onMutedChange={setVoiceMuted}
+              onRegisterActions={registerVoiceActions}
+            />
+          ) : null}
+          </View>
 
           {editingMessageId ? null : (
           <View style={styles.composerArea}>
-            {conversationMessages.length === 0 ? (
+            {conversationMessages.length === 0 && !desktopVoice ? (
               <ScrollView
                 style={styles.suggestionsScroll}
                 horizontal
@@ -1092,8 +1138,8 @@ export default function AskPranaScreen() {
               </ScrollView>
             ) : null}
 
-            <View style={styles.inputRow}>
-              <View style={[styles.inputShell, isDesktop && styles.inputShellDesktop]}>
+            <View style={[styles.inputRow, desktopVoice && styles.inputRowVoice]}>
+              <View style={[styles.inputShell, isDesktop && styles.inputShellDesktop, desktopVoice && styles.inputShellVoice]}>
                 <View
                   ref={attachWrapRef}
                   nativeID="ask-prana-attach-wrap"
@@ -1140,7 +1186,7 @@ export default function AskPranaScreen() {
                   ref={composerInputRef}
                   value={draft}
                   onChangeText={setDraft}
-                  placeholder={placeholder}
+                  placeholder={desktopVoice ? "Type" : placeholder}
                   placeholderTextColor={colors.muted}
                   style={[
                     styles.textInput,
@@ -1183,16 +1229,28 @@ export default function AskPranaScreen() {
                   blurOnSubmit={false}
                   returnKeyType="send"
                   submitBehavior="submit"
-                  onSubmitEditing={handleComposerEnter}
+                  onSubmitEditing={() => {
+                    if (desktopVoice) {
+                      voiceActionsRef.current?.submitTyped();
+                      return;
+                    }
+                    handleComposerEnter();
+                  }}
                   onKeyPress={(event) => {
                     if (event.nativeEvent.key !== "Enter") return;
                     event.preventDefault();
+                    if (desktopVoice) {
+                      voiceActionsRef.current?.submitTyped();
+                      return;
+                    }
                     handleComposerEnter();
                   }}
                   enablesReturnKeyAutomatically
                   scrollEnabled={composerInputHeight >= composerInputMaxHeight}
                   onContentSizeChange={handleComposerContentSizeChange}
                 />
+                {desktopVoice ? null : (
+                <>
                 <Pressable
                   onPress={handleMicPress}
                   disabled={
@@ -1254,7 +1312,29 @@ export default function AskPranaScreen() {
                     <Feather name="radio" size={16} color={colors.white} />
                   </Pressable>
                 )}
+                </>
+                )}
               </View>
+              {desktopVoice ? (
+                <>
+                  <Pressable
+                    onPress={() => voiceActionsRef.current?.toggleMute()}
+                    style={styles.voiceMuteButton}
+                    accessibilityRole="button"
+                    accessibilityLabel={voiceMuted ? "Unmute" : "Mute"}
+                  >
+                    <Feather name={voiceMuted ? "mic" : "mic-off"} size={18} color={colors.white} />
+                  </Pressable>
+                  <Pressable
+                    onPress={() => voiceActionsRef.current?.end()}
+                    style={styles.voiceCloseButton}
+                    accessibilityRole="button"
+                    accessibilityLabel="End voice"
+                  >
+                    <Feather name="x" size={20} color="#111111" />
+                  </Pressable>
+                </>
+              ) : null}
             </View>
 
               {canExpandDraft ? (
@@ -1274,7 +1354,7 @@ export default function AskPranaScreen() {
                 </View>
               ) : null}
 
-            {isRecording ? (
+            {isRecording && !voiceModeOpen ? (
               <View style={styles.recordingControls}>
                 <Text style={styles.recordingHint}>
                   {t("askPrana.recordingTimer", {
@@ -1319,6 +1399,47 @@ export default function AskPranaScreen() {
             ) : null}
           </View>
           )}
+
+          {voiceModeOpen && !isDesktop ? (
+            <View style={styles.mobileVoiceCover}>
+              <AskPranaVoiceModeModal
+                visible
+                variant="screen"
+                language={preferredLanguage}
+                requestContext={requestContext}
+                isRecording={isRecording}
+                isTranscribing={isTranscribing}
+                isSending={isSending}
+                draft={draft}
+                onChangeDraft={setDraft}
+                onClose={() => {
+                  setVoiceModeOpen(false);
+                  setVoiceMuted(false);
+                  void stopAskPranaSpeech();
+                  void cancelAudioRecording();
+                }}
+                onStartListening={() =>
+                  startAudioRecording({ source: "voice", throwOnFailure: true })
+                }
+                onCancelListening={cancelAudioRecording}
+                onStopListeningToTranscript={stopAudioRecordingToTranscript}
+                onAsk={async (question, context) => askFromVoiceMode(question, context)}
+                onLanguageChange={async (code) => {
+                  await cancelAudioRecording();
+                  await handleSelectLanguage(code);
+                }}
+                onOpenMenu={() => setSidebarOpen(true)}
+                onAddImage={() => {
+                  void sendImageAttachment(requestContext);
+                }}
+                onAddFile={() => {
+                  void sendDocumentAttachment(requestContext);
+                }}
+                addImageLabel={t("askPrana.addImage")}
+                addFileLabel={t("askPrana.addFile")}
+              />
+            </View>
+          ) : null}
 
             </View>
           </View>
@@ -1477,32 +1598,6 @@ export default function AskPranaScreen() {
         </KeyboardAvoidingView>
       </Modal>
 
-      <AskPranaVoiceModeModal
-        visible={voiceModeOpen}
-        language={preferredLanguage}
-        requestContext={requestContext}
-        isRecording={isRecording}
-        isTranscribing={isTranscribing}
-        isSending={isSending}
-        draft={draft}
-        onChangeDraft={setDraft}
-        onClose={() => {
-          setVoiceModeOpen(false);
-          void stopAskPranaSpeech();
-          void cancelAudioRecording();
-        }}
-        onStartListening={() =>
-          startAudioRecording({ source: "voice", throwOnFailure: true })
-        }
-        onCancelListening={cancelAudioRecording}
-        onStopListeningToTranscript={stopAudioRecordingToTranscript}
-        onAsk={async (question, context) => askFromVoiceMode(question, context)}
-        onLanguageChange={async (code) => {
-          await cancelAudioRecording();
-          await handleSelectLanguage(code);
-        }}
-      />
-
       <AskPranaAttachmentViewer
         uri={attachmentPreview?.uri}
         fileName={attachmentPreview?.fileName}
@@ -1531,7 +1626,41 @@ const styles = StyleSheet.create({
     flexBasis: 0,
     minWidth: 0,
     minHeight: 0,
+    position: "relative",
     backgroundColor: colors.background,
+  },
+  messageColumn: {
+    flex: 1,
+    minHeight: 0,
+    position: "relative",
+  },
+  mobileVoiceCover: {
+    position: "absolute",
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    zIndex: 30,
+    backgroundColor: "#000000",
+  },
+  inputShellVoice: {
+    width: "auto",
+  },
+  voiceMuteButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "#2F2F2F",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  voiceCloseButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "#FFFFFF",
+    alignItems: "center",
+    justifyContent: "center",
   },
   chatList: { flex: 1, backgroundColor: colors.background },
   header: {
@@ -1795,6 +1924,9 @@ const styles = StyleSheet.create({
     gap: 8,
     width: "100%",
     maxWidth: 900,
+  },
+  inputRowVoice: {
+    alignItems: "center",
   },
   attachWrap: { position: "relative" },
   attachButton: {
