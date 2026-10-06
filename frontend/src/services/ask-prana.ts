@@ -4,6 +4,7 @@ import {
   getSupabasePublicConfig,
   supabase,
 } from "../lib/supabase";
+import { explicitReplyLanguageLabel } from "../lib/ask-prana-translation-policy";
 import { getCurrentUserProfile, resolveFarmerDisplayName } from "./profile";
 
 export type AskPranaGeneratedFile = {
@@ -30,17 +31,57 @@ export async function translateAskPranaHistory(
   // the English UI. Callers only send text that is not already in `language`.
   if (texts.length === 0) return texts;
   const auth = await requireAskPranaAuth();
-  const result = await supabase.functions.invoke("ask-prana", {
-    body: { task: "translate-history", texts, language },
-    headers: { Authorization: `Bearer ${auth.accessToken}` },
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("Translation request timed out."));
+    }, 45_000);
   });
-  if (result.error || !Array.isArray(result.data?.translations)) {
-    throw new Error("Historical translation is unavailable.");
+  let result: { data: { translations?: unknown } | null; error: unknown };
+  try {
+    result = await Promise.race([
+      supabase.functions.invoke("ask-prana", {
+        body: { task: "translate-history", texts, language },
+        headers: { Authorization: `Bearer ${auth.accessToken}` },
+        signal: controller.signal,
+      }),
+      timeout,
+    ]);
+  } catch (error) {
+    if (controller.signal.aborted || (error instanceof Error && error.message === "Translation request timed out.")) {
+      throw new Error("Translation request timed out.");
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-  if (result.data.translations.length !== texts.length) {
+  const translations = result.data?.translations;
+  if (result.error || !Array.isArray(translations)) {
+    const context = (result.error as { context?: Response } | null)?.context;
+    const status = context && typeof context.status === "number" ? context.status : undefined;
+    let detail = result.error instanceof Error ? result.error.message : "";
+    if (context && typeof context.json === "function") {
+      try {
+        const body = await context.json() as { error?: unknown; status?: unknown };
+        if (typeof body?.error === "string" && body.error.trim()) {
+          detail = body.status ? `${body.error} (openai ${body.status})` : body.error;
+        }
+      } catch {
+        // The body can only be read once; keep the generic message.
+      }
+    }
+    throw new Error(
+      status
+        ? `Historical translation failed (${status}): ${detail || "no response body"}`
+        : `Historical translation is unavailable.${detail ? ` ${detail}` : ""}`,
+    );
+  }
+  if (translations.length !== texts.length) {
     throw new Error("Historical translation returned an incomplete batch.");
   }
-  return result.data.translations.map((value: unknown, index: number) =>
+  return translations.map((value: unknown, index: number) =>
     typeof value === "string" && value.trim() ? value.trim() : (() => { throw new Error(`Missing translation at index ${index}.`); })(),
   );
 }
@@ -397,6 +438,9 @@ export async function askPrana(
     )
     .slice(0, 5);
 
+  const explicitLanguage =
+    explicitReplyLanguageLabel(enriched.sessionLanguageCode) ??
+    explicitReplyLanguageLabel(enriched.voiceModeLanguageLock);
   const requestBody: Record<string, unknown> = {
     mode: isGeneric ? "generic" : "pond",
     question,
@@ -404,13 +448,13 @@ export async function askPrana(
     userId,
     conversationHistory: enriched.conversationHistory ?? [],
     attachments,
-    language: await resolveAskPranaLanguage(enriched.language),
-    // The farmer's selected Ask Prana language is final for this turn; the Edge
-    // Function must not re-detect it from the question text.
-    languageLock: Boolean(enriched.voiceModeLanguageLock?.trim()),
+    language: explicitLanguage ?? (await resolveAskPranaLanguage(enriched.language)),
+    sessionLanguageCode: enriched.sessionLanguageCode ?? enriched.voiceModeLanguageLock ?? null,
+    languageLock: Boolean(explicitLanguage),
     inputMode: enriched.inputMode === "voice" ? "voice" : "text",
-    languageNotes:
-      typeof enriched.languageNotes === "string" && enriched.languageNotes.trim()
+    languageNotes: explicitLanguage
+      ? `Reply only in ${explicitLanguage}. Do not switch language to match the question.`
+      : typeof enriched.languageNotes === "string" && enriched.languageNotes.trim()
         ? enriched.languageNotes.trim()
         : null,
     farmerDisplayName:

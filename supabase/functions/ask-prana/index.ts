@@ -2,6 +2,7 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import {
+  describeOpenAIResponse,
   extractOpenAIOutputText,
   OPENAI_MODEL,
   OPENAI_RESPONSES_URL,
@@ -44,6 +45,7 @@ const MAX_IMAGE_BYTES = 12_000_000;
 const MAX_FILE_BYTES = 20_000_000;
 const MIN_IMAGE_BYTES = 32;
 const MAX_TEXT_CHARS = 80_000;
+let translationStructuredOutput = false;
 
 const IMAGE_PROCESSING_ERROR =
   "Image could not be processed. Please try uploading it again.";
@@ -1013,6 +1015,32 @@ function buildDataQualityNotes(log: Record<string, unknown> | null) {
   ].join("\n");
 }
 
+function clarificationInConfiguredLanguage(answer: string, language: string): string {
+  const trimmed = answer.trim();
+  if ((language !== "Telugu" && language !== "Hindi") || trimmed.length > 240) return answer;
+  const englishClarification =
+    /please say it again|couldn.?t understand|didn.?t understand|ask me again|ask your question again|not sure what you.?re referring/i
+      .test(trimmed);
+  if (!englishClarification) return answer;
+  if (/say it again/i.test(trimmed)) {
+    return language === "Telugu"
+      ? "అది నాకు అర్థం కాలేదు. దయచేసి మళ్లీ చెప్పండి."
+      : "मुझे वह समझ नहीं आया। कृपया फिर से बोलें।";
+  }
+  return language === "Telugu"
+    ? "మీ ప్రశ్న నాకు అర్థం కాలేదు. దయచేసి మరోసారి అడగండి."
+    : "मुझे आपका प्रश्न समझ नहीं आया। कृपया दोबारा पूछें।";
+}
+
+function translationTargetLanguage(value: unknown): "English" | "Hindi" | "Telugu" | null {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (!raw || raw === "auto") return null;
+  if (raw === "te" || raw === "telugu" || raw.includes("తెలుగు")) return "Telugu";
+  if (raw === "hi" || raw === "hindi" || raw.includes("हिन्दी") || raw.includes("हिंदी")) return "Hindi";
+  if (raw === "en" || raw === "english") return "English";
+  return null;
+}
+
 function normalizeFarmerLanguage(value: unknown): string {
   const raw = String(value ?? "").trim().toLowerCase();
   if (raw === "te" || raw === "telugu" || raw.includes("తెలుగు")) return "Telugu";
@@ -1302,6 +1330,59 @@ function storedFilePath(value: unknown) {
   return path.slice(0, 500);
 }
 
+function sessionSummary(session: {
+  id: string;
+  title?: string | null;
+  created_at: string;
+  updated_at: string;
+  preview?: string | null;
+  last_message_at?: string | null;
+  content?: string | null;
+}) {
+  const text = (session.preview ?? session.content ?? "").replace(/\s+/g, " ").trim();
+  return {
+    id: session.id,
+    pondId: null,
+    title: session.title || "New conversation",
+    preview: text.length > 80 ? `${text.slice(0, 77)}...` : text,
+    createdAt: session.created_at,
+    lastActivity: session.last_message_at || session.updated_at,
+  };
+}
+
+async function listConversationsWithoutPreview(
+  supabase: SupabaseClient,
+  userId: string,
+  limit: number,
+) {
+  const { data: sessions, error } = await supabase
+    .from("chat_sessions")
+    .select("id, title, created_at, updated_at")
+    .eq("user_id", userId)
+    .order("updated_at", { ascending: false })
+    .limit(limit);
+  if (error) return jsonResponse({ error: "Unable to load your conversation history. Please try again." }, 500);
+  const withPreview = await Promise.all((sessions ?? []).map(async (session) => {
+    const { data: message } = await supabase
+      .from("chat_messages")
+      .select("content, created_at")
+      .eq("session_id", session.id)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (!message) return null;
+    return sessionSummary({
+      ...session,
+      preview: message.content,
+      last_message_at: message.created_at,
+    });
+  }));
+  return jsonResponse({
+    sessions: withPreview.filter((session) => session !== null),
+    nextCursor: null,
+  });
+}
+
 async function handleConversations(
   supabase: SupabaseClient,
   userId: string,
@@ -1314,47 +1395,33 @@ async function handleConversations(
   const op = typeof body.op === "string" ? body.op : "";
 
   if (op === "list") {
-    const { data: sessions, error } = await supabase
+    const limitRaw = Number(body.limit);
+    const limit = Number.isFinite(limitRaw) ? Math.min(50, Math.max(1, Math.floor(limitRaw))) : 20;
+    const cursor = typeof body.cursor === "string" ? body.cursor : "";
+    const started = Date.now();
+    let query = supabase
       .from("chat_sessions")
-      .select("id, title, created_at, updated_at")
+      .select("id, title, created_at, updated_at, preview, last_message_at")
       .eq("user_id", userId)
-      .order("updated_at", { ascending: false });
+      .not("last_message_at", "is", null)
+      .order("last_message_at", { ascending: false })
+      .limit(limit + 1);
+    if (cursor) query = query.lt("last_message_at", cursor);
+    const { data: sessions, error } = await query;
+    if (error && /preview|last_message_at|column/i.test(`${error.message ?? ""} ${error.code ?? ""}`)) {
+      return await listConversationsWithoutPreview(supabase, userId, limit);
+    }
     if (error) {
       console.warn("[ask-prana] chat_sessions list failed", error.code ?? "");
       return jsonResponse({ error: "Unable to load your conversation history. Please try again." }, 500);
     }
-    const ids = (sessions ?? []).map((session) => session.id);
-    const previewBySession = new Map<string, { content: string; created_at: string }>();
-    if (ids.length) {
-      const { data: messages } = await supabase
-        .from("chat_messages")
-        .select("session_id, content, created_at")
-        .in("session_id", ids)
-        .order("created_at", { ascending: false });
-      for (const message of messages ?? []) {
-        if (!previewBySession.has(message.session_id)) {
-          previewBySession.set(message.session_id, {
-            content: message.content ?? "",
-            created_at: message.created_at,
-          });
-        }
-      }
-    }
+    const rows = sessions ?? [];
+    const page = rows.slice(0, limit);
+    const nextCursor = rows.length > limit ? page[page.length - 1]?.last_message_at ?? null : null;
+    console.info("[ask-prana] conversation page", { ms: Date.now() - started, count: page.length });
     return jsonResponse({
-      sessions: (sessions ?? [])
-        .filter((session) => previewBySession.has(session.id))
-        .map((session) => {
-          const preview = previewBySession.get(session.id);
-          const text = (preview?.content ?? "").replace(/\s+/g, " ").trim();
-          return {
-            id: session.id,
-            pondId: null,
-            title: session.title || "New conversation",
-            preview: text.length > 80 ? `${text.slice(0, 77)}...` : text,
-            createdAt: session.created_at,
-            lastActivity: preview?.created_at || session.updated_at,
-          };
-        }),
+      sessions: page.map((session) => sessionSummary(session)),
+      nextCursor,
     });
   }
 
@@ -1401,14 +1468,22 @@ async function handleConversations(
   }
 
   if (op === "messages") {
-    const { data, error } = await supabase
+    const limitRaw = Number(body.limit);
+    const limit = Number.isFinite(limitRaw) ? Math.min(50, Math.max(1, Math.floor(limitRaw))) : 40;
+    const before = typeof body.before === "string" ? body.before : "";
+    let query = supabase
       .from("chat_messages")
       .select("id, session_id, user_id, role, content, message_type, file_path, file_name, mime_type, created_at")
       .eq("session_id", sessionId)
       .eq("user_id", userId)
-      .order("created_at", { ascending: true });
+      .order("created_at", { ascending: false })
+      .limit(limit + 1);
+    if (before) query = query.lt("created_at", before);
+    const { data, error } = await query;
     if (error) return jsonResponse({ error: "Unable to open the conversation." }, 500);
-    return jsonResponse({ messages: data ?? [] });
+    const rows = data ?? [];
+    const hasMore = rows.length > limit;
+    return jsonResponse({ messages: rows.slice(0, limit).reverse(), hasMore });
   }
 
   if (op === "save") {
@@ -1437,11 +1512,24 @@ async function handleConversations(
     const nextTitle = role === "user" && (!currentTitle || currentTitle === "New conversation")
       ? content.replace(/\s+/g, " ").trim().slice(0, 60) || "New conversation"
       : currentTitle || "New conversation";
-    await supabase
+    const preview = content.replace(/\s+/g, " ").trim().slice(0, 80);
+    const stamped = await supabase
       .from("chat_sessions")
-      .update({ title: nextTitle, updated_at: new Date().toISOString() })
+      .update({
+        title: nextTitle,
+        updated_at: message.created_at,
+        preview,
+        last_message_at: message.created_at,
+      })
       .eq("id", sessionId)
       .eq("user_id", userId);
+    if (stamped.error) {
+      await supabase
+        .from("chat_sessions")
+        .update({ title: nextTitle, updated_at: new Date().toISOString() })
+        .eq("id", sessionId)
+        .eq("user_id", userId);
+    }
     return jsonResponse({ message });
   }
 
@@ -1929,13 +2017,6 @@ serve(async (req) => {
   }
 
   const authorization = req.headers.get("Authorization");
-  console.log("[ask-prana] Authorization Header", authorization
-    ? `${authorization.slice(0, 24)}…`
-    : null);
-  console.log(
-    "[ask-prana] Request Headers",
-    Object.fromEntries(req.headers.entries()),
-  );
 
   if (!authorization?.startsWith("Bearer ")) {
     console.error("[ask-prana] Missing Authorization Bearer token");
@@ -1972,7 +2053,7 @@ serve(async (req) => {
     const tokenHash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
     const { data: appSession } = await supabase
       .from("user_sessions")
-      .select("user_id, expires_at, revoked_at")
+      .select("user_id, expires_at, revoked_at, last_seen_at")
       .eq("token_hash", tokenHash)
       .maybeSingle();
     const expiresAt = appSession?.expires_at ? new Date(String(appSession.expires_at)).getTime() : 0;
@@ -1980,7 +2061,10 @@ serve(async (req) => {
       return jsonResponse({ error: "Invalid JWT or user not authenticated." }, 401);
     }
     authUser = { id: String(appSession.user_id) };
-    await supabase.from("user_sessions").update({ last_seen_at: new Date().toISOString() }).eq("token_hash", tokenHash);
+    const seenAt = appSession.last_seen_at ? new Date(String(appSession.last_seen_at)).getTime() : 0;
+    if (!seenAt || Date.now() - seenAt >= 5 * 60 * 1000) {
+      await supabase.from("user_sessions").update({ last_seen_at: new Date().toISOString() }).eq("token_hash", tokenHash);
+    }
   } else {
     const {
       data: { user },
@@ -2002,22 +2086,31 @@ serve(async (req) => {
 
   console.log("[ask-prana] Authenticated user", authUser.id);
 
+  let body: Record<string, unknown> = {};
+  try {
+    body = await req.json();
+  } catch {
+    return jsonResponse({ error: "Invalid request." }, 400);
+  }
+  const taskName = typeof body.task === "string" ? body.task : "";
+
   let dbLanguageRaw: unknown = null;
   let dbFarmerNameRaw: unknown = null;
-  try {
-    const { data: userRow } = await supabase
-      .from("users")
-      .select("name, language")
-      .eq("id", authUser.id)
-      .maybeSingle();
-    dbLanguageRaw = userRow?.language ?? null;
-    dbFarmerNameRaw = userRow?.name ?? null;
-  } catch (languageError) {
-    console.error("[ask-prana] users.profile fetch skipped:", languageError);
+  if (taskName !== "conversations" && taskName !== "upload-file" && taskName !== "translate-history") {
+    try {
+      const { data: userRow } = await supabase
+        .from("users")
+        .select("name, language")
+        .eq("id", authUser.id)
+        .maybeSingle();
+      dbLanguageRaw = userRow?.language ?? null;
+      dbFarmerNameRaw = userRow?.name ?? null;
+    } catch (languageError) {
+      console.error("[ask-prana] users.profile fetch skipped:", languageError);
+    }
   }
 
   try {
-    const body = await req.json();
     const {
       question,
       pondId,
@@ -2042,6 +2135,7 @@ serve(async (req) => {
       texts,
       languageLock,
       inputMode,
+      sessionLanguageCode,
     } = body ?? {};
 
     if (task === "conversations") {
@@ -2062,9 +2156,10 @@ serve(async (req) => {
     const detectedQuestionLanguage = detectQuestionLanguage(questionText);
     // The app sends languageLock when the farmer selected a language in Ask
     // Prana; that selection is final and must not be re-detected from text.
-    const languageLocked = languageLock === true && Boolean(language);
+    const explicitSessionLanguage = translationTargetLanguage(sessionLanguageCode);
+    const languageLocked = (languageLock === true && Boolean(language)) || Boolean(explicitSessionLanguage);
     const configuredLanguage = languageLocked
-      ? clientLanguage
+      ? explicitSessionLanguage || clientLanguage
       : detectedQuestionLanguage || clientLanguage;
     const languageNotesText =
       typeof languageNotes === "string" ? languageNotes.trim() : "";
@@ -2107,46 +2202,111 @@ serve(async (req) => {
     });
 
     if (task === "translate-history") {
-      const sourceTexts = Array.isArray(texts)
-        ? texts.filter((text): text is string => typeof text === "string" && text.trim()).slice(0, 40)
-        : [];
-      if (sourceTexts.length === 0) return jsonResponse({ translations: [] });
+      const target = translationTargetLanguage(language);
+      if (!target) return jsonResponse({ error: "A target language of English, Hindi, or Telugu is required." }, 400);
+      const rawTexts = Array.isArray(texts) ? texts : null;
+      if (!rawTexts || rawTexts.length === 0 || rawTexts.length > 80) {
+        return jsonResponse({ error: "Translation requires 1 to 80 texts." }, 400);
+      }
+      const sourceTexts = rawTexts.map((value: unknown) => String(value ?? ""));
+      if (sourceTexts.some((text) => !text.trim() || text.length > 24000)) {
+        return jsonResponse({ error: "Each translation text must be non-empty and at most 24000 characters." }, 400);
+      }
       const apiKey = Deno.env.get("OPENAI_API_KEY");
       if (!apiKey) return jsonResponse({ error: "LLM API key is missing." }, 500);
-      const target = clientLanguage === "Telugu" ? "Telugu (Telugu script)" : clientLanguage === "Hindi" ? "Hindi (Devanagari)" : "English";
-      // Translation needs no deliberation: the lightest reasoning effort cuts
-      // latency substantially. Fall back to "low" if the model rejects it.
-      const requestTranslation = (effort: "minimal" | "low") =>
-        fetch(OPENAI_RESPONSES_URL, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: OPENAI_MODEL,
-            instructions: `Translate every array item fully into ${target}; no item may remain in its original language. Items are aquaculture chat titles, previews, questions and answers (including error messages). Preserve meaning, numbers, markdown formatting (headings, bullets, bold, tables), line breaks, and item order. Technical terms and units (pH, DO, FCR, ABW, MQTT, RS485, Modbus, mg/L, ppm) may stay in Latin script. Return ONLY a JSON array of strings, with exactly ${sourceTexts.length} items.`,
-            input: JSON.stringify(sourceTexts),
-            reasoning: { effort },
-            // Indic scripts need several tokens per character, and reasoning
-            // tokens share this budget; a tight budget truncates the JSON.
-            max_output_tokens: Math.min(16000, sourceTexts.join(" ").length * 4 + 1500),
-          }),
-        });
-      let response = await requestTranslation("minimal");
-      let data = await response.json() as Record<string, unknown>;
-      if (response.status === 400 && /reasoning|effort/i.test(JSON.stringify(data))) {
-        response = await requestTranslation("low");
-        data = await response.json() as Record<string, unknown>;
-      }
-      if (!response.ok) {
-        const parsed = parseOpenAIError(response.status, data);
-        return jsonResponse({ error: parsed.message }, parsed.httpStatus);
-      }
+      const script = target === "Telugu" ? "Telugu script" : target === "Hindi" ? "Devanagari" : "English";
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 40_000);
+      // Match the working chat call: reasoning effort "low", no json_schema.
+      // A schema rejection used to return 502 immediately, which the client
+      // stored as "Historical translation is unavailable." and left the English
+      // chat on screen. Fall back inside this same request.
+      let includeSchema = translationStructuredOutput;
+      let includeReasoning = true;
+      const tried = new Set<string>();
       try {
-        const translated = JSON.parse(extractOpenAIOutputText(data));
-        if (!Array.isArray(translated) || translated.length !== sourceTexts.length || !translated.every((text) => typeof text === "string" && text.trim())) throw new Error("invalid translation output");
-        return jsonResponse({ translations: translated });
+        while (tried.size < 3) {
+          const attemptKey = `${includeSchema}|${includeReasoning}`;
+          if (tried.has(attemptKey)) break;
+          tried.add(attemptKey);
+          const translationSchema = includeSchema
+            ? {
+              type: "json_schema",
+              name: "ask_prana_translations",
+              strict: true,
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  items: { type: "array", items: { type: "string" } },
+                },
+                required: ["items"],
+              },
+            }
+            : undefined;
+          const response = await fetch(OPENAI_RESPONSES_URL, {
+            method: "POST",
+            signal: controller.signal,
+            headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: Deno.env.get("ASK_PRANA_TRANSLATION_MODEL") || OPENAI_MODEL,
+              instructions: `Translate every item fully into ${target} (${script}). Preserve meaning, numbers, markdown, line breaks, and order. Keep pH, DO, FCR, DOC, Vannamei, biomass, salinity, mg/L, and ppm in Latin script. Return a JSON array of exactly ${sourceTexts.length} strings.`,
+              input: JSON.stringify(sourceTexts),
+              max_output_tokens: 16000,
+              ...(includeReasoning ? { reasoning: { effort: "low" } } : {}),
+              ...(translationSchema ? { text: { format: translationSchema } } : {}),
+            }),
+          });
+          const data = await response.json() as Record<string, unknown>;
+          const described = JSON.stringify(data);
+          if (response.status === 400 && includeSchema && /schema|text\.format|json_schema/i.test(described)) {
+            console.error("[ask-prana] history translation schema rejected", describeOpenAIResponse(data));
+            translationStructuredOutput = false;
+            includeSchema = false;
+            continue;
+          }
+          if (response.status === 400 && /reasoning|effort/i.test(described)) {
+            console.error("[ask-prana] history translation reasoning rejected", described.slice(0, 500));
+            includeReasoning = !includeReasoning;
+            continue;
+          }
+          if (!response.ok) {
+            const parsed = parseOpenAIError(response.status, data);
+            console.error("[ask-prana] history translation openai", response.status, parsed.message);
+            return jsonResponse({ error: parsed.message, status: response.status }, parsed.httpStatus);
+          }
+          const outputText = extractOpenAIOutputText(data).replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
+          let parsedOutput: unknown;
+          try {
+            parsedOutput = JSON.parse(outputText);
+          } catch (parseError) {
+            console.error("[ask-prana] history translation parse failed", describeOpenAIResponse(data), parseError);
+            return jsonResponse({ error: "Translation response could not be parsed." }, 502);
+          }
+          const translated = Array.isArray(parsedOutput)
+            ? parsedOutput
+            : parsedOutput && typeof parsedOutput === "object" && Array.isArray((parsedOutput as { items?: unknown }).items)
+              ? (parsedOutput as { items: unknown[] }).items
+              : parsedOutput && typeof parsedOutput === "object" && Array.isArray((parsedOutput as { translations?: unknown }).translations)
+                ? (parsedOutput as { translations: unknown[] }).translations
+                : null;
+          if (
+            !translated ||
+            translated.length !== sourceTexts.length ||
+            !translated.every((text) => typeof text === "string" && text.trim())
+          ) {
+            console.error("[ask-prana] history translation incomplete", describeOpenAIResponse(data));
+            return jsonResponse({ error: "Translation response was incomplete." }, 502);
+          }
+          return jsonResponse({ translations: translated });
+        }
+        return jsonResponse({ error: "Translation request was rejected." }, 502);
       } catch (error) {
-        console.error("[ask-prana] history translation parse failed", error);
+        if (controller.signal.aborted) return jsonResponse({ error: "Translation timed out." }, 504);
+        console.error("[ask-prana] history translation failed", error);
         return jsonResponse({ error: "Translation response could not be parsed." }, 502);
+      } finally {
+        clearTimeout(timer);
       }
     }
 
@@ -2975,7 +3135,9 @@ If this is a normal water/feed question with no prior health context, do not men
     });
 
     if (!documentExportQuestion) {
-      return jsonResponse({ answer });
+      return jsonResponse({
+        answer: clarificationInConfiguredLanguage(answer, configuredLanguage),
+      });
     }
 
     return await packageDocumentExport(answer);

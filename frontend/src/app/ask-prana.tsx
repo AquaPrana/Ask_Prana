@@ -59,12 +59,10 @@ import {
 import { speakAskPranaText, stopAskPranaSpeech } from "../lib/ask-prana-speech";
 import { type AskPranaRequestContext } from "../services/ask-prana";
 import {
-  getAskPranaDisplayLanguage,
+  retryAskPranaVisibleTranslations,
   selectAskPranaLanguageWhenReady,
   useAskPranaDisplayTranslation,
 } from "../lib/ask-prana-display-translation";
-import { useProfile } from "../context/profile-context";
-
 const colors = {
   primary: "#4F8CF7",
   primaryDark: "#2F67D6",
@@ -99,8 +97,6 @@ const LANGUAGE_SHORT_LABELS: Record<AskPranaSpeechLanguageCode, string> = {
   te: "Te",
   hi: "Hi",
 };
-/** Newest message texts translated ahead of older history on a language switch. */
-const VISIBLE_TRANSLATION_PRIORITY_COUNT = 16;
 const COMPOSER_INPUT_LINE_HEIGHT = 20;
 const COMPOSER_INPUT_MIN_VIEWPORT_MAX_HEIGHT = 120;
 const COMPOSER_INPUT_ABSOLUTE_MAX_HEIGHT = 144;
@@ -274,7 +270,6 @@ export default function AskPranaScreen() {
     start: number;
     end: number;
   } | null>(null);
-  const { refreshProfile } = useProfile();
   const insets = useSafeAreaInsets();
   const composerInputMaxHeight = useMemo(() => {
     // Android may either resize the layout or report the keyboard separately.
@@ -302,6 +297,9 @@ export default function AskPranaScreen() {
     generationStopped,
     pendingAttachments,
     activeSessionId,
+    hasOlderMessages,
+    isLoadingOlder,
+    loadOlderMessages,
     setDraft,
     removePendingAttachment,
     sendQuestion,
@@ -340,40 +338,19 @@ export default function AskPranaScreen() {
   }, [activeSessionId, isAuthLoading, openConversation, routeSessionId]);
 
   useEffect(() => {
-    const shown = getAskPranaDisplayLanguage();
-    if (mapToAskPranaLanguageCode(i18n.resolvedLanguage) === shown) return;
-    // Layout restores the saved language before the chat cache is ready.
-    // Put the menus back until the question, answer, and titles can move together.
-    void setAppLanguage(shown);
-    setPreferredLanguage(shown);
-  }, [i18n.resolvedLanguage]);
-
-  useEffect(() => {
     void (async () => {
-      // The app language (loaded before first render) is the single source of
-      // truth; the Ask Prana key is only a fallback for older installs.
       const storedAppLanguage = await AsyncStorage.getItem(LANGUAGE_STORAGE_KEY);
       const loaded = mapToAskPranaLanguageCode(
         storedAppLanguage || (await loadAskPranaPreferredLanguage()),
       );
-      // Always persist only en/te/hi so legacy codes never reappear in the picker.
       const allowed =
         loaded === "en" || loaded === "te" || loaded === "hi" ? loaded : "en";
-      await saveAskPranaPreferredLanguage(allowed, { explicit: true });
       setTeluguScript(await loadTeluguScriptPreference());
-      // A stored Hindi or Telugu choice must not change the menus until the
-      // open question, answer, and sidebar title can change with them.
-      const shown = getAskPranaDisplayLanguage();
-      if (mapToAskPranaLanguageCode(i18n.language) !== shown) {
-        void setAppLanguage(shown);
-      }
-      setPreferredLanguage(shown);
-      if (allowed !== shown) {
-        selectAskPranaLanguageWhenReady(allowed, (language) => {
-          setPreferredLanguage(language);
-          void setAppLanguage(language);
-        });
-      }
+      selectAskPranaLanguageWhenReady(allowed, (language) => {
+        setPreferredLanguage(language);
+        void setAppLanguage(language);
+        void saveAskPranaPreferredLanguage(language, { explicit: true });
+      });
     })();
   }, []);
 
@@ -407,12 +384,6 @@ export default function AskPranaScreen() {
     [t],
   );
 
-  useFocusEffect(
-    useCallback(() => {
-      void refreshProfile();
-    }, [refreshProfile]),
-  );
-
   const thinkingVisible = thinkingKind != null || isSending;
   // While the latest question asks for a file, say so instead of "Thinking...".
   const lastUserText = [...messages].reverse().find((message) => message.role === "user")?.text ?? "";
@@ -432,20 +403,14 @@ export default function AskPranaScreen() {
   const isTranslatableMessage = (message: ChatMessage) =>
     Boolean(message.text?.trim()) &&
     !(message.messageType !== "text" && message.fileName && message.text === message.fileName);
-  // Newest first: the latest turns are what the farmer sees, so they are
-  // batched and translated before older messages.
   const translationSources = conversationMessages.flatMap((message) => [
     ...(isTranslatableMessage(message) ? [message.text] : []),
     ...(message.transcript?.trim() ? [message.transcript] : []),
   ]).reverse();
   // Originals in `messages` are never modified; only the rendered copy changes.
-  // The newest texts (what is on screen) are translated first; older ones
-  // follow in the background. The chat is also pre-translated into the other
-  // languages at idle, so a later switch is served from cache.
-  const { displayText: displayMessageText } =
+  const { displayText: displayMessageText, contentPhase } =
     useAskPranaDisplayTranslation(translationSources, "visible", {
-      prefetchOtherLanguages: true,
-      priorityCount: VISIBLE_TRANSLATION_PRIORITY_COUNT,
+      prefetchOtherLanguages: false,
     });
   // Reuse the previous display object when a message's shown text is unchanged,
   // so the memoized bubbles only re-render for messages whose translation landed.
@@ -952,6 +917,13 @@ export default function AskPranaScreen() {
 
 
           <View style={styles.messageColumn}>
+          {contentPhase === "loading" ? (
+            <Text style={styles.translationBanner}>{t("askPrana.translating")}</Text>
+          ) : contentPhase === "error" ? (
+            <Pressable onPress={() => retryAskPranaVisibleTranslations()} accessibilityRole="button">
+              <Text style={styles.translationBanner}>{t("askPrana.translationUnavailable")}</Text>
+            </Pressable>
+          ) : null}
           {isLoadingMessages ? (
             <View style={styles.loadingState}>
               <ActivityIndicator size="large" color={colors.primary} />
@@ -966,6 +938,23 @@ export default function AskPranaScreen() {
               showsVerticalScrollIndicator={false}
               keyboardShouldPersistTaps="handled"
               keyboardDismissMode="interactive"
+              ListHeaderComponent={
+                hasOlderMessages ? (
+                  <Pressable
+                    onPress={() => void loadOlderMessages()}
+                    disabled={isLoadingOlder}
+                    accessibilityRole="button"
+                    accessibilityLabel={t("askPrana.loadEarlierMessages")}
+                    style={styles.loadingState}
+                  >
+                    {isLoadingOlder ? (
+                      <ActivityIndicator size="small" color={colors.primary} />
+                    ) : (
+                      <Text style={styles.emptyChatCopy}>{t("askPrana.loadEarlierMessages")}</Text>
+                    )}
+                  </Pressable>
+                ) : null
+              }
               ListEmptyComponent={
                 <View style={styles.emptyChat}>
                   <AskPranaLogo size={72} decorative style={styles.emptyChatLogo} />
@@ -1633,6 +1622,14 @@ const styles = StyleSheet.create({
     flex: 1,
     minHeight: 0,
     position: "relative",
+  },
+  translationBanner: {
+    color: colors.muted,
+    fontFamily: ASK_PRANA_FONT_FAMILY,
+    fontSize: 13,
+    lineHeight: 18,
+    textAlign: "center",
+    paddingVertical: 6,
   },
   mobileVoiceCover: {
     position: "absolute",

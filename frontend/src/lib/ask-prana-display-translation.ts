@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useId, useSyncExternalStore } from "react";
 import { Platform } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 import { translateAskPranaHistory } from "../services/ask-prana";
 import { type AskPranaSpeechLanguageCode } from "./ask-prana-language";
+import { acceptDisplayTranslation, isStaleTranslation, shouldSendTranslation } from "./ask-prana-translation-policy";
 
 /**
  * Display-only translation store shared by the Ask Prana sidebar and chat.
@@ -13,10 +14,10 @@ import { type AskPranaSpeechLanguageCode } from "./ask-prana-language";
  *   never be read while Telugu is selected.
  * - Persisted per language on the device, so reopening Ask Prana or switching
  *   back to a language reuses earlier translations without new API calls.
- * - Requests made in the same tick are merged into batches; in-flight units are
- *   never requested twice. The open chat ("visible") is served before sidebar
- *   and older history ("background"), in small parallel batches so the first
- *   paragraphs land quickly instead of waiting for one long model response.
+ * - The open chat and visible sidebar share one request. Each message, title,
+ *   and preview is one cache entry. The painted language changes only when
+ *   that whole visible set is ready, so the screen does not stay in English
+ *   one paragraph at a time.
  * - The open chat is also pre-translated into the other languages at idle
  *   ("prefetch"), so switching language on it is served from cache.
  * - Until a translation arrives the original text is shown, so the chat never
@@ -40,7 +41,8 @@ type Job = { language: Language; priority: AskPranaTranslationPriority; texts: s
 // Model latency grows with output length, so the visible chat uses small
 // batches that run in parallel; the sidebar/history uses larger ones.
 const BATCH_LIMITS: Record<AskPranaTranslationPriority, { items: number; chars: number }> = {
-  visible: { items: 3, chars: 320 },
+  // One request for the open chat and visible sidebar. Do not slice an answer into lines.
+  visible: { items: 80, chars: 400000 },
   background: { items: 24, chars: 2400 },
   prefetch: { items: 8, chars: 1400 },
 };
@@ -49,7 +51,7 @@ const MAX_CONCURRENT_REQUESTS = 6;
 const MAX_CONCURRENT_BY_PRIORITY: Record<AskPranaTranslationPriority, number> = {
   visible: MAX_CONCURRENT_REQUESTS,
   background: 2,
-  prefetch: 4,
+  prefetch: 1,
 };
 const RETRY_AFTER_MS = 5_000;
 const MAX_ATTEMPTS = 2;
@@ -72,11 +74,17 @@ const inFlightByPriority: Record<AskPranaTranslationPriority, number> = {
 };
 const listeners = new Set<() => void>();
 let version = 0;
+/** Language the picker selected. */
 let activeLanguage: Language = "en";
+/** Language currently painted. It changes only when the whole visible set is ready. */
+let paintedLanguage: Language = "en";
 /** Bumped on clear (sign-out) so late responses from the previous user are dropped. */
 let generation = 0;
 
 let notifyLanguageSwap: () => void = () => {};
+let rateLimitedUntil = 0;
+let rateLimitRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let automaticRateLimitRetry = true;
 
 function emit() {
   version += 1;
@@ -196,66 +204,7 @@ export function isTextInAskPranaLanguage(text: string, language: Language) {
 }
 
 function isValidTranslation(source: string, translated: string, language: Language) {
-  if (!translated.trim()) return false;
-  if (language === "en") {
-    return countMatches(translated, TELUGU) + countMatches(translated, DEVANAGARI) === 0;
-  }
-  const own = countMatches(translated, language === "hi" ? DEVANAGARI : TELUGU);
-  const other = countMatches(translated, language === "hi" ? TELUGU : DEVANAGARI);
-  if (other > 0) return false;
-  // A source made only of technical terms/numbers may come back unchanged.
-  const sourceHasWords =
-    countMatches(source.replace(URLS, " ").replace(TECHNICAL_TERMS, " "), LATIN_WORD) > 0;
-  return own > 0 || !sourceHasWords;
-}
-
-type Paragraph = { raw: string; key: string | null };
-
-/** Lines longer than this are split at sentence ends. */
-const MAX_UNIT_CHARS = 480;
-
-function pushUnit(out: Paragraph[], raw: string, language: Language) {
-  out.push(
-    !raw.trim() || isTextInAskPranaLanguage(raw, language)
-      ? { raw, key: null }
-      : { raw, key: raw.trim() },
-  );
-}
-
-/**
- * Splits text into translation units: one per line (list items, headings,
- * sentences), with very long lines split at sentence ends. Small units keep
- * each model response short — so requests run in parallel, finish quickly and
- * are never truncated. `key` is set only for natural-language units not
- * already in `language`; separators and fenced code blocks are kept as-is.
- */
-function splitParagraphs(text: string, language: Language): Paragraph[] {
-  const out: Paragraph[] = [];
-  let inFence = false;
-  text.split(/(\n+)/).forEach((raw, index) => {
-    if (index % 2 === 1) {
-      out.push({ raw, key: null });
-      return;
-    }
-    if (raw.trimStart().startsWith("```")) {
-      inFence = !inFence;
-      out.push({ raw, key: null });
-      return;
-    }
-    if (inFence) {
-      out.push({ raw, key: null });
-      return;
-    }
-    if (raw.length <= MAX_UNIT_CHARS) {
-      pushUnit(out, raw, language);
-      return;
-    }
-    raw.split(/([.!?]\s+)/).forEach((piece, pieceIndex) => {
-      if (pieceIndex % 2 === 1) out.push({ raw: piece, key: null });
-      else pushUnit(out, piece, language);
-    });
-  });
-  return out;
+  return acceptDisplayTranslation({ language, source, translated });
 }
 
 type Resolved = { status: AskPranaTranslationStatus; text: string };
@@ -268,27 +217,18 @@ function isRetryable(entry: Entry | undefined, now = Date.now()) {
   );
 }
 
-/** The whole string, or the original until every paragraph is translated. */
+function needsTranslation(text: string, language: Language) {
+  return Boolean(text?.trim()) && !isTextInAskPranaLanguage(text, language);
+}
+
+/** One cache entry per message, title, or preview. The original stays until that whole string is ready. */
 function resolveText(text: string, language: Language): Resolved {
-  if (!text) return { status: "ready", text };
-  const cache = store[language];
-  const out: string[] = [];
-  for (const paragraph of splitParagraphs(text, language)) {
-    const entry = paragraph.key ? cache.get(paragraph.key) : undefined;
-    if (!paragraph.key) {
-      out.push(paragraph.raw);
-      continue;
-    }
-    if (entry?.status === "ready" && entry.value != null) {
-      const leading = paragraph.raw.match(/^\s*/)?.[0] ?? "";
-      const trailing = paragraph.raw.match(/\s*$/)?.[0] ?? "";
-      out.push(`${leading}${entry.value}${trailing}`);
-      continue;
-    }
-    const status = entry?.status === "error" ? "error" : entry?.status === "loading" ? "loading" : "not_loaded";
-    return { status, text };
-  }
-  return { status: "ready", text: out.join("") };
+  if (!needsTranslation(text, language)) return { status: "ready", text };
+  const entry = store[language].get(text.trim());
+  if (entry?.status === "ready" && entry.value) return { status: "ready", text: entry.value };
+  if (entry?.status === "error") return { status: "error", text };
+  if (entry?.status === "loading") return { status: "loading", text };
+  return { status: "not_loaded", text };
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +345,7 @@ function pump() {
     const cache = store[job.language];
     // Prefetch deliberately targets other languages; everything else is
     // dropped once the farmer has switched away from its language.
-    if (job.priority !== "prefetch" && job.language !== activeLanguage) {
+    if (job.priority !== "prefetch" && isStaleTranslation(job.language, activeLanguage)) {
       // The farmer switched away; forget these so switching back re-requests them.
       for (const text of job.texts) {
         if (cache.get(text)?.status === "loading") cache.delete(text);
@@ -427,36 +367,63 @@ function pump() {
           if (typeof value === "string" && isValidTranslation(text, value, job.language)) {
             cache.set(text, { status: "ready", value: value.trim() });
           } else {
+            if (__DEV__) {
+              console.log("[AskPranaTranslation] rejected", {
+                language: job.language,
+                preview: typeof value === "string" ? value.slice(0, 120) : value,
+              });
+            }
             const attempts = (cache.get(text)?.attempts ?? 0) + 1;
             cache.set(text, { status: "error", failedAt: Date.now(), attempts });
             if (__DEV__ && metrics?.to === job.language) metrics.failed += 1;
           }
         });
         schedulePersist(job.language);
+        automaticRateLimitRetry = true;
       })
       .catch((error) => {
         if (jobGeneration !== generation) return;
-        if (job.texts.length > 1) {
-          // Retry items individually so one bad item cannot block the batch.
-          for (const text of job.texts) {
-            queues[job.priority].push({ language: job.language, priority: job.priority, texts: [text] });
-          }
-          return;
-        }
+        const message = error instanceof Error ? error.message : String(error);
         if (__DEV__) {
           console.log("[AskPranaTranslation] failed", {
             language: job.language,
-            error: error instanceof Error ? error.message : String(error),
+            error: message,
           });
           if (metrics?.to === job.language) metrics.failed += 1;
         }
-        const attempts = (cache.get(job.texts[0])?.attempts ?? 0) + 1;
-        cache.set(job.texts[0], { status: "error", failedAt: Date.now(), attempts });
+        const rateLimited = /429|rate limit/i.test(message);
+        if (rateLimited) {
+          rateLimitedUntil = Date.now() + 20_000;
+          for (const priority of PRIORITY_ORDER) {
+            for (const queued of queues[priority]) {
+              for (const text of queued.texts) {
+                const queuedCache = store[queued.language];
+                if (queuedCache.get(text)?.status === "loading") {
+                  queuedCache.set(text, { status: "error", failedAt: Date.now(), attempts: 1 });
+                }
+              }
+            }
+            queues[priority].length = 0;
+          }
+          if (automaticRateLimitRetry && !rateLimitRetryTimer) {
+            automaticRateLimitRetry = false;
+            rateLimitRetryTimer = setTimeout(() => {
+              rateLimitRetryTimer = null;
+              rateLimitedUntil = 0;
+              retryAskPranaVisibleTranslations();
+            }, 20_000);
+          }
+        }
+        for (const text of job.texts) {
+          const attempts = (cache.get(text)?.attempts ?? 0) + 1;
+          cache.set(text, { status: "error", failedAt: Date.now(), attempts });
+        }
       })
       .finally(() => {
         inFlightByPriority[job.priority] -= 1;
+        revealPaintedLanguage();
         emit();
-        pump();
+        if (Date.now() >= rateLimitedUntil) pump();
         checkSwitchMetrics();
       });
   }
@@ -486,10 +453,6 @@ export function requestAskPranaDisplayTranslations(
   priority: AskPranaTranslationPriority = "background",
 ) {
   const isPrefetch = priority === "prefetch";
-  if (!isPrefetch) {
-    if (language !== activeLanguage) startSwitchMetrics(activeLanguage, language);
-    activeLanguage = language;
-  }
   if (!hydrated) {
     // Wait for the device cache first so cached text is never re-requested.
     void ensureHydrated().then(() => requestAskPranaDisplayTranslations(texts, language, priority));
@@ -512,23 +475,22 @@ export function requestAskPranaDisplayTranslations(
   const seen = new Set(bucket.units);
   let added = false;
   for (const text of texts) {
-    if (!text) continue;
-    for (const paragraph of splitParagraphs(text, language)) {
-      const key = paragraph.key;
-      if (!key || seen.has(key)) continue;
-      seen.add(key);
-      const entry = cache.get(key);
-      if (entry?.status === "ready") {
-        if (__DEV__ && !isPrefetch && metrics?.to === language) metrics.cached += 1;
-        continue;
-      }
-      if (entry?.status === "loading") continue;
-      if (entry?.status === "error" && !isRetryable(entry, timestamp)) continue;
-      cache.set(key, { status: "loading", attempts: entry?.attempts });
-      bucket.units.push(key);
-      if (__DEV__ && !isPrefetch && metrics?.to === language) metrics.needTranslation += 1;
-      added = true;
+    const key = text?.trim();
+    if (!key || !needsTranslation(text, language) || seen.has(key)) continue;
+    seen.add(key);
+    const entry = cache.get(key);
+    if (Date.now() < rateLimitedUntil) {
+      cache.set(key, { status: "error", failedAt: timestamp, attempts: entry?.attempts ?? 1 });
+      continue;
     }
+    if (!shouldSendTranslation(entry?.status, isRetryable(entry, timestamp))) {
+      if (entry?.status === "ready" && __DEV__ && !isPrefetch && metrics?.to === language) metrics.cached += 1;
+      continue;
+    }
+    cache.set(key, { status: "loading", attempts: entry?.attempts });
+    bucket.units.push(key);
+    if (__DEV__ && !isPrefetch && metrics?.to === language) metrics.needTranslation += 1;
+    added = true;
   }
   if (added) {
     pendingUnits.set(bucketKey, bucket);
@@ -545,16 +507,57 @@ export function requestAskPranaDisplayTranslations(
  * changing the picker can never be the cause of a translate-history call.
  */
 export function getAskPranaDisplayLanguage(): Language {
-  return activeLanguage;
+  return paintedLanguage;
 }
 
 export function setAskPranaDisplayLanguage(language: Language) {
-  if (language === activeLanguage) return;
-  startSwitchMetrics(activeLanguage, language);
-  activeLanguage = language;
+  if (language !== activeLanguage) {
+    startSwitchMetrics(activeLanguage, language);
+    activeLanguage = language;
+  }
+  const texts = visibleAskPranaTexts();
+  if (texts.length) requestAskPranaDisplayTranslations(texts, language, "visible");
+  revealPaintedLanguage();
   version += 1;
   for (const listener of listeners) listener();
   checkSwitchMetrics();
+}
+
+function revealPaintedLanguage() {
+  if (visibleTextSets.size === 0) return;
+  if (!isAskPranaDisplayLanguageReady(activeLanguage)) return;
+  if (paintedLanguage === activeLanguage) return;
+  paintedLanguage = activeLanguage;
+  version += 1;
+  for (const listener of listeners) listener();
+}
+
+export function getAskPranaVisibleTranslationPhase(): "ready" | "loading" | "error" {
+  if (paintedLanguage === activeLanguage && isAskPranaDisplayLanguageReady(activeLanguage)) return "ready";
+  const texts = visibleAskPranaTexts().filter((text) => text?.trim());
+  if (texts.length === 0) return paintedLanguage === activeLanguage ? "ready" : "loading";
+  const statuses = texts.map((text) => resolveText(text, activeLanguage).status);
+  if (statuses.some((status) => status === "loading" || status === "not_loaded")) return "loading";
+  if (statuses.some((status) => status === "error")) return "error";
+  if (paintedLanguage !== activeLanguage) return "loading";
+  return "ready";
+}
+
+export function retryAskPranaVisibleTranslations() {
+  rateLimitedUntil = 0;
+  if (rateLimitRetryTimer) {
+    clearTimeout(rateLimitRetryTimer);
+    rateLimitRetryTimer = null;
+  }
+  const language = activeLanguage;
+  const cache = store[language];
+  for (const text of visibleAskPranaTexts()) {
+    const key = text?.trim();
+    if (key && cache.get(key)?.status === "error") cache.delete(key);
+  }
+  requestAskPranaDisplayTranslations(visibleAskPranaTexts(), language, "visible");
+  version += 1;
+  for (const listener of listeners) listener();
 }
 
 const visibleTextSets = new Map<string, readonly string[]>();
@@ -596,25 +599,29 @@ function flushPendingLanguageSwap() {
 notifyLanguageSwap = flushPendingLanguageSwap;
 
 /**
- * Applies `language` only when the whole visible set is already cached.
- * The picker must not queue a translation. Prefetch started when the
- * messages arrived; this waits for that cache and then swaps once.
+ * Labels switch immediately. Cached chat text paints in the same turn.
+ * Missing text is one visible request, then the chat and sidebar change together.
  */
 export function selectAskPranaLanguageWhenReady(
   language: Language,
   apply: (language: Language) => void,
 ) {
-  const commit = () => {
-    if (isAskPranaDisplayLanguageReady(language)) {
-      pendingLanguageSwap = null;
-      setAskPranaDisplayLanguage(language);
-      apply(language);
-      return;
-    }
-    pendingLanguageSwap = { language, apply };
+  pendingLanguageSwap = null;
+  if (language !== activeLanguage) {
+    startSwitchMetrics(activeLanguage, language);
+    activeLanguage = language;
+  }
+  apply(language);
+  const request = () => {
+    if (activeLanguage !== language) return;
+    const texts = visibleAskPranaTexts();
+    if (texts.length) requestAskPranaDisplayTranslations(texts, language, "visible");
+    revealPaintedLanguage();
+    version += 1;
+    for (const listener of listeners) listener();
   };
-  if (hydrated) commit();
-  else void ensureHydrated().then(commit);
+  if (hydrated) request();
+  else void ensureHydrated().then(request);
 }
 
 /**
@@ -630,67 +637,69 @@ export function useAskPranaDisplayTranslation(
     priorityCount?: number;
   },
 ) {
-  void priority;
-  void options;
   const sourceId = useId();
   const storeVersion = useSyncExternalStore(subscribe, getVersion, getVersion);
   const signature = texts.join("␞");
-  // The committed display language, not i18next. i18next changes in the same
-  // update that selects this cache, so menus and chat cannot move apart.
-  const language = storeVersion >= 0 ? activeLanguage : activeLanguage;
-
-  const preparedSignatureRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    registerVisibleAskPranaTexts(sourceId, signature ? signature.split("␞") : []);
-    return () => unregisterVisibleAskPranaTexts(sourceId);
-  }, [signature, sourceId]);
+  const priorityCount = options?.priorityCount;
+  const prefetchOtherLanguages = options?.prefetchOtherLanguages;
+  const selectedLanguage = storeVersion >= 0 ? activeLanguage : activeLanguage;
+  const language = storeVersion >= 0 ? paintedLanguage : paintedLanguage;
 
   useEffect(() => {
-    if (!signature || preparedSignatureRef.current === signature) return;
-    preparedSignatureRef.current = signature;
-    const sources = signature.split("␞");
-    // Store English, Hindi, and Telugu when the text arrives. A later picker
-    // click only reads this cache and must not start another request.
-    for (const target of LANGUAGES) {
-      requestAskPranaDisplayTranslations(sources, target, "prefetch");
+    const sources = signature ? signature.split("␞") : [];
+    const count = priorityCount == null ? sources.length : Math.max(0, priorityCount);
+    const urgent = sources.slice(0, count);
+    registerVisibleAskPranaTexts(sourceId, urgent);
+    if (urgent.length) {
+      requestAskPranaDisplayTranslations(urgent, activeLanguage, priority);
+      revealPaintedLanguage();
     }
-  }, [signature]);
-
-  const retryDue = useMemo(() => {
-    if (storeVersion < 0 || !signature) return false;
-    const sources = signature.split("␞");
-    return LANGUAGES.some((target) => {
-      const cache = store[target];
-      return sources.some((text) =>
-        splitParagraphs(text, target).some((paragraph) => {
-          const entry = paragraph.key ? cache.get(paragraph.key) : undefined;
-          return entry?.status === "error" && (entry.attempts ?? 1) < MAX_ATTEMPTS;
-        }),
-      );
-    });
-  }, [signature, storeVersion]);
+    return () => unregisterVisibleAskPranaTexts(sourceId);
+  }, [signature, sourceId, priority, priorityCount, selectedLanguage]);
 
   useEffect(() => {
-    if (!retryDue) return;
-    const timer = setTimeout(() => {
-      const sources = signature.split("␞");
+    if (paintedLanguage !== activeLanguage || !signature || priorityCount == null) return;
+    const rest = signature.split("␞").slice(Math.max(0, priorityCount));
+    if (rest.length) requestAskPranaDisplayTranslations(rest, activeLanguage, "background");
+  }, [signature, language, selectedLanguage, priorityCount]);
+
+  useEffect(() => {
+    if (!signature || prefetchOtherLanguages === false) return;
+    if (paintedLanguage !== activeLanguage) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const sources = signature.split("␞");
+    const scheduleOthers = () => {
+      if (cancelled) return;
+      if (queues.visible.length || inFlightByPriority.visible > 0) {
+        timer = setTimeout(scheduleOthers, 500);
+        return;
+      }
       for (const target of LANGUAGES) {
+        if (target === activeLanguage) continue;
         requestAskPranaDisplayTranslations(sources, target, "prefetch");
       }
-    }, RETRY_AFTER_MS);
-    return () => clearTimeout(timer);
-  }, [retryDue, signature]);
+    };
+    const idle = typeof requestIdleCallback === "function" ? requestIdleCallback(() => scheduleOthers()) : null;
+    if (idle == null) timer = setTimeout(scheduleOthers, 1500);
+    return () => {
+      cancelled = true;
+      if (idle != null && typeof cancelIdleCallback === "function") cancelIdleCallback(idle);
+      if (timer != null) clearTimeout(timer);
+    };
+  }, [signature, language, selectedLanguage, prefetchOtherLanguages]);
+
+  const contentPhase = storeVersion >= 0 ? getAskPranaVisibleTranslationPhase() : "ready";
 
   const getStatus = useCallback(
-    (text: string) => (storeVersion >= 0 ? resolveText(text, activeLanguage).status : "not_loaded"),
+    (text: string) => (storeVersion >= 0 ? resolveText(text, paintedLanguage).status : "not_loaded"),
     [storeVersion],
   );
 
   const displayText = useCallback(
-    (text: string) => (storeVersion >= 0 ? resolveText(text, activeLanguage).text : text),
+    (text: string) => (storeVersion >= 0 ? resolveText(text, paintedLanguage).text : text),
     [storeVersion],
   );
 
-  return { language, displayText, getStatus };
+  return { language, displayText, getStatus, contentPhase, retryVisibleTranslations: retryAskPranaVisibleTranslations };
 }

@@ -148,8 +148,8 @@ export function AskPranaChatSidebar({
   const { displayName, avatarUrl, avatarUpdatedAt } = useProfile();
   const {
     activeSessionId,
-    messages,
-    listConversations,
+    listConversationPage,
+    conversationActivity,
     startNewConversation,
     openConversation,
     renameConversation,
@@ -159,6 +159,8 @@ export function AskPranaChatSidebar({
   const [sessions, setSessions] = useState<AskPranaSessionSummary[]>([]);
   const [searchText, setSearchText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   // i18n key, so the message follows the selected language.
   const [loadError, setLoadError] = useState<string | null>(null);
   const [menuSessionId, setMenuSessionId] = useState<string | null>(null);
@@ -171,6 +173,7 @@ export function AskPranaChatSidebar({
   const [pinnedSessionIds, setPinnedSessionIds] = useState<string[]>([]);
   const [pinsLoaded, setPinsLoaded] = useState(false);
   const historyRequestIdRef = useRef(0);
+  const historyInflightRef = useRef<Promise<void> | null>(null);
   const normalizedSearch = searchText.trim().toLocaleLowerCase();
 
   useEffect(() => {
@@ -217,36 +220,80 @@ export function AskPranaChatSidebar({
   }, [menuSessionId]);
 
   const loadHistory = useCallback(
-    async () => {
+    async (cursor?: string | null) => {
+      if (!cursor && historyInflightRef.current) return historyInflightRef.current;
       const requestId = ++historyRequestIdRef.current;
-      setIsLoading(true);
+      const started = Date.now();
+      if (cursor) setIsLoadingMore(true);
+      else setIsLoading(true);
       setLoadError(null);
-      try {
-        const next = await listConversations();
-        if (requestId === historyRequestIdRef.current) setSessions(next);
-      } catch {
-        if (requestId === historyRequestIdRef.current) {
-          setSessions([]);
+      const run = (async () => {
+        try {
+          const page = await listConversationPage(cursor);
+          if (requestId !== historyRequestIdRef.current) return;
+          setSessions((current) => {
+            if (!cursor) return page.sessions;
+            const seen = new Set(current.map((session) => session.id));
+            return [...current, ...page.sessions.filter((session) => !seen.has(session.id))];
+          });
+          setNextCursor(page.nextCursor);
+          console.info("[history] page", {
+            ms: Date.now() - started,
+            count: page.sessions.length,
+            cursor: Boolean(cursor),
+          });
+        } catch {
+          if (requestId !== historyRequestIdRef.current) return;
           setLoadError("askPrana.historyLoadError");
+        } finally {
+          if (requestId === historyRequestIdRef.current) {
+            setIsLoading(false);
+            setIsLoadingMore(false);
+          }
         }
-      } finally {
-        if (requestId === historyRequestIdRef.current) setIsLoading(false);
-      }
+      })();
+      if (!cursor) historyInflightRef.current = run;
+      await run;
+      if (!cursor && historyInflightRef.current === run) historyInflightRef.current = null;
     },
-    [listConversations],
+    [listConversationPage],
   );
+
+  useEffect(() => {
+    setSessions([]);
+    setNextCursor(null);
+    setLoadError(null);
+  }, [listConversationPage]);
 
   useEffect(() => {
     if (!visible) return;
     const timer = setTimeout(() => void loadHistory(), 0);
     return () => clearTimeout(timer);
-  }, [activeSessionId, loadHistory, messages.length, visible]);
+  }, [loadHistory, visible]);
+
+  useEffect(() => {
+    if (!conversationActivity) return;
+    setSessions((current) => {
+      const existing = current.find((session) => session.id === conversationActivity.id);
+      const updated: AskPranaSessionSummary = {
+        id: conversationActivity.id,
+        pondId: existing?.pondId ?? null,
+        title: existing?.title || conversationActivity.preview || "New conversation",
+        preview: conversationActivity.preview,
+        createdAt: existing?.createdAt || conversationActivity.lastActivity,
+        lastActivity: conversationActivity.lastActivity,
+      };
+      return [updated, ...current.filter((session) => session.id !== conversationActivity.id)];
+    });
+  }, [conversationActivity]);
 
   // Every loaded session (pinned, grouped and search results alike) is
   // translated into the selected language; originals are never shown as a
   // fallback while another language is selected.
   const { displayText, getStatus } = useAskPranaDisplayTranslation(
     sessions.flatMap((session) => [session.title, session.preview].filter(Boolean)),
+    "visible",
+    { prefetchOtherLanguages: false },
   );
 
   const visibleSessions = useMemo(() => {
@@ -411,18 +458,21 @@ export function AskPranaChatSidebar({
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator={false}
       >
-        {isLoading || !pinsLoaded ? (
+        {sessions.length === 0 && (isLoading || !pinsLoaded) ? (
           <View style={styles.loadingState}>
             <ActivityIndicator size="small" color={colors.accent} />
           </View>
-        ) : loadError ? (
-          <Text style={styles.emptyText}>{t(loadError)}</Text>
+        ) : sessions.length === 0 && loadError ? (
+          <Pressable onPress={() => void loadHistory()} accessibilityRole="button">
+            <Text style={styles.emptyText}>{t(loadError)}</Text>
+          </Pressable>
         ) : groupedSessions.length === 0 && pinnedSessions.length === 0 ? (
           <Text style={styles.emptyText}>
             {normalizedSearch ? t("askPrana.noConversationsFound") : t("askPrana.historyEmpty")}
           </Text>
         ) : (
           <>
+          {loadError ? <Text style={styles.emptyText}>{t(loadError)}</Text> : null}
           {pinnedSessions.length > 0 ? (
             <View style={styles.group}>
               <Text style={styles.groupLabel}>{t("askPrana.pinned")}</Text>
@@ -572,6 +622,21 @@ export function AskPranaChatSidebar({
               })}
             </View>
           ))}
+          {nextCursor ? (
+            <Pressable
+              onPress={() => void loadHistory(nextCursor)}
+              disabled={isLoadingMore}
+              style={styles.profileRow}
+              accessibilityRole="button"
+              accessibilityLabel={t("askPrana.loadMoreHistory")}
+            >
+              {isLoadingMore ? (
+                <ActivityIndicator size="small" color={colors.accent} />
+              ) : (
+                <Text style={styles.emptyText}>{t("askPrana.loadMoreHistory")}</Text>
+              )}
+            </Pressable>
+          ) : null}
           </>
         )}
       </ScrollView>

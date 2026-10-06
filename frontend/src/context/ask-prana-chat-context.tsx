@@ -656,6 +656,18 @@ type AskPranaChatContextValue = {
   startNewConversation: () => Promise<void>;
   openConversation: (sessionId: string) => Promise<void>;
   listConversations: () => Promise<AskPranaSessionSummary[]>;
+  listConversationPage: (
+    cursor?: string | null,
+  ) => Promise<{ sessions: AskPranaSessionSummary[]; nextCursor: string | null }>;
+  conversationActivity: {
+    id: string;
+    preview: string;
+    lastActivity: string;
+    nonce: number;
+  } | null;
+  hasOlderMessages: boolean;
+  isLoadingOlder: boolean;
+  loadOlderMessages: () => Promise<void>;
   renameConversation: (
     sessionId: string,
     title: string,
@@ -704,8 +716,16 @@ function buildAttachmentPrompt(
 }
 
 export function AskPranaChatProvider({ children }: { children: ReactNode }) {
-  const { displayName, refreshProfile } = useProfile();
+  const { displayName } = useProfile();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [conversationActivity, setConversationActivity] = useState<{
+    id: string;
+    preview: string;
+    lastActivity: string;
+    nonce: number;
+  } | null>(null);
+  const [hasOlderMessages, setHasOlderMessages] = useState(false);
+  const [isLoadingOlder, setIsLoadingOlder] = useState(false);
   const [draft, setDraft] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
@@ -726,6 +746,10 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
   );
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
+  useEffect(() => {
+    setConversationActivity(null);
+    setHasOlderMessages(false);
+  }, [userId]);
   /**
    * Recently opened conversations (per user) so reopening one from History
    * renders instantly while a fresh copy loads. Display-only; never written back.
@@ -1124,7 +1148,6 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
 
     const bootstrap = async () => {
       const session = await waitForAuthReady();
-      await refreshProfile();
 
       if (!mounted) {
         return;
@@ -1186,7 +1209,6 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
           return;
         }
 
-        void refreshProfile();
         void refreshPonds(nextUserId);
       },
     );
@@ -1195,7 +1217,7 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
       mounted = false;
       unsubscribeAuth();
     };
-  }, [refreshPonds, refreshProfile]);
+  }, [refreshPonds]);
 
   useEffect(() => {
     const welcome = buildWelcomeMessage(farmerName);
@@ -1389,7 +1411,7 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
           fetchedMessages,
         ] = await Promise.all([
           getAskPranaSessionPondId(nextSessionId, userId ?? undefined),
-          fetchAskPranaMessages(nextSessionId, userId ?? undefined, expectedPondId),
+          fetchAskPranaMessages(nextSessionId, userId ?? undefined),
         ]);
 
         if (epoch !== pondLoadEpochRef.current) {
@@ -1430,7 +1452,8 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
           return;
         }
 
-        const { messages: storedMessages, error } = fetchedMessages;
+        const { messages: storedMessages, hasMore, error } = fetchedMessages;
+        setHasOlderMessages(Boolean(hasMore));
 
         if (error) {
           console.log("[AskPranaChat] open conversation error:", error);
@@ -1486,31 +1509,70 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
     [farmerName, setActiveSessionId, userId],
   );
 
-  const listConversations = useCallback(async () => {
+  const listConversationPage = useCallback(async (cursor?: string | null) => {
     if (!userId) {
-      return [];
+      return { sessions: [], nextCursor: null };
     }
 
     const pondId =
       selectedPondId === GENERIC_ASSISTANT_ID ? null : selectedPondId;
 
     try {
-      const { sessions, error } = await listAskPranaSessionsForPond(
+      const { sessions, nextCursor, error } = await listAskPranaSessionsForPond(
         userId,
         pondId,
+        cursor,
       );
 
       if (error) {
         console.log("[AskPranaChat] list conversations error:", error);
-        return [];
+        throw error;
       }
 
-      return sessions;
+      return { sessions, nextCursor };
     } catch (error) {
       console.log("[AskPranaChat] list conversations failed:", error);
-      return [];
+      throw error instanceof Error ? error : new Error("Unable to load your conversation history. Please try again.");
     }
   }, [selectedPondId, userId]);
+
+  const listConversations = useCallback(async () => {
+    try {
+      const page = await listConversationPage();
+      return page.sessions;
+    } catch {
+      return [];
+    }
+  }, [listConversationPage]);
+
+  const loadOlderMessages = useCallback(async () => {
+    if (!userId || !sessionId || isLoadingOlder || !hasOlderMessages) return;
+    const oldest = messagesRef.current.find((message) => message.createdAt);
+    const before = oldest?.createdAt;
+    if (!before) {
+      setHasOlderMessages(false);
+      return;
+    }
+    setIsLoadingOlder(true);
+    try {
+      const { messages: older, hasMore, error } = await fetchAskPranaMessages(
+        sessionId,
+        userId,
+        { before },
+      );
+      if (error) return;
+      setHasOlderMessages(hasMore);
+      if (older.length === 0) return;
+      setMessages((current) => {
+        const seen = new Set(current.map((message) => message.id));
+        const next = [...older.filter((message) => !seen.has(message.id)), ...current];
+        messagesRef.current = next;
+        return next;
+      });
+    } finally {
+      setIsLoadingOlder(false);
+    }
+  }, [hasOlderMessages, isLoadingOlder, sessionId, userId]);
 
   const renameConversation = useCallback(
     async (targetSessionId: string, title: string) => {
@@ -1590,6 +1652,15 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
         return message;
       }
 
+      const previewSource = (saved ?? message).text || message.transcript || "";
+      const preview = previewSource.replace(/\s+/g, " ").trim().slice(0, 80);
+      setConversationActivity({
+        id: activeSessionId,
+        preview,
+        lastActivity: (saved ?? message).createdAt || new Date().toISOString(),
+        nonce: Date.now(),
+      });
+
       return saved ?? message;
     },
     [ensureSession, farmerName, selectedPondName, userId],
@@ -1634,10 +1705,7 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
           explicitAttachments.length === 0 && attachments.length > 0,
       });
 
-      const latestProfile = await refreshProfile();
-      const nameForRequest =
-        latestProfile?.name?.trim() ||
-        (farmerName !== "Farmer" ? farmerName : null);
+      const nameForRequest = farmerName !== "Farmer" ? farmerName : null;
 
       // Match THIS question: Telugu→Telugu, English→English (UI preference is fallback only).
       const sessionCode = requestContext?.sessionLanguageCode
@@ -1719,7 +1787,7 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
         messageType: "text",
       };
     },
-    [ensureSession, resolveContext, userId, farmerName, refreshProfile],
+    [ensureSession, resolveContext, userId, farmerName],
   );
 
   const appendAssistantReply = useCallback(
@@ -2844,6 +2912,11 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
       startNewConversation,
       openConversation,
       listConversations,
+      listConversationPage,
+      conversationActivity,
+      hasOlderMessages,
+      isLoadingOlder,
+      loadOlderMessages,
       renameConversation,
       deleteConversation,
     }),
@@ -2884,6 +2957,11 @@ export function AskPranaChatProvider({ children }: { children: ReactNode }) {
       startNewConversation,
       openConversation,
       listConversations,
+      listConversationPage,
+      conversationActivity,
+      hasOlderMessages,
+      isLoadingOlder,
+      loadOlderMessages,
       renameConversation,
       deleteConversation,
     ],
